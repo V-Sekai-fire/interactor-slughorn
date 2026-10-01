@@ -6,7 +6,8 @@ project(slughorn LANGUAGES C CXX VERSION 0.0.3)
 # Compile options
 # =============================================================================
 
-if(WIN32)
+# MSVC (not WIN32): a mingw/clang toolchain on Windows takes the GNU-style flags below.
+if(MSVC)
 	set(SLUGHORN_COMPILE_OPTIONS
 		/W4
 		/WX
@@ -155,6 +156,10 @@ if(SLUGHORN_CLIPPER2)
 	)
 	target_include_directories(slughorn_clipper2 SYSTEM PUBLIC "${_slughorn_clipper2_dir}/include")
 	target_compile_features(slughorn_clipper2 PUBLIC cxx_std_17)
+	# clipper.core.h uses std::back_inserter without including <iterator> (MSVC's STL hides it).
+	target_compile_options(slughorn_clipper2 PRIVATE
+		$<IF:$<CXX_COMPILER_ID:MSVC>,/FIiterator,SHELL:-include iterator>
+	)
 	set_target_properties(slughorn_clipper2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 	target_compile_definitions(slughorn PUBLIC SLUGHORN_HAS_CLIPPER2)
@@ -176,6 +181,37 @@ if(SLUGHORN_THORVG)
 	endif()
 
 	set(_slughorn_tvg "${CMAKE_CURRENT_SOURCE_DIR}/ext/thorvg")
+
+	# Godot's own ThorVG patch (thirdparty/thorvg/patches/0001-let-delete-be-delete.patch,
+	# GH-116024): ThorVG 1.0.x replaces the GLOBAL operator new/delete with tvg::malloc/free,
+	# which collides with any host that defines them too (godot-sandbox's guest runtime does) and
+	# silently reroutes every allocation of the embedding program otherwise. Applied the same
+	# idempotent way as the NanoSVG patches above.
+	find_package(Git REQUIRED)
+
+	set(_slughorn_tvg_patch "${CMAKE_CURRENT_SOURCE_DIR}/ext/thorvg-00-let-delete-be-delete.diff")
+
+	execute_process(
+		COMMAND "${GIT_EXECUTABLE}" apply --reverse --check --ignore-whitespace "${_slughorn_tvg_patch}"
+		WORKING_DIRECTORY "${_slughorn_tvg}"
+		RESULT_VARIABLE _slughorn_tvg_patch_applied
+		OUTPUT_QUIET
+		ERROR_QUIET
+	)
+
+	if(NOT _slughorn_tvg_patch_applied EQUAL 0)
+		message(STATUS "Applying thorvg patch: ${_slughorn_tvg_patch}")
+
+		execute_process(
+			COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace "${_slughorn_tvg_patch}"
+			WORKING_DIRECTORY "${_slughorn_tvg}"
+			RESULT_VARIABLE _slughorn_tvg_patch_result
+		)
+
+		if(NOT _slughorn_tvg_patch_result EQUAL 0)
+			message(FATAL_ERROR "Failed to apply thorvg patch: ${_slughorn_tvg_patch}")
+		endif()
+	endif()
 	set(_slughorn_tvg_config "${CMAKE_CURRENT_BINARY_DIR}/thorvg-config")
 
 	set(_slughorn_tvg_threads "")

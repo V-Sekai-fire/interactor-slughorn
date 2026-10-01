@@ -464,6 +464,63 @@ struct BakedMesh {
 
 namespace detail {
 
+// earcut eliminates holes by bridging them into the outer ring one at a time, which is quadratic
+// in the hole count - a background minus thousands of planarized speckles stalls it. Large
+// regions are therefore cut into a grid of tiles (Clipper2 RectClip keeps holes as holes) and each
+// tile triangulated on its own. Costs a few extra triangles along tile seams.
+inline constexpr size_t TILE_VERTICES = 384;
+
+}
+
+// Planarization tile budget: the canvas is cut into a G x G grid with about this many region
+// vertices per tile (G <= 32).
+inline constexpr size_t PLANAR_TILE_VERTICES = 2048;
+
+namespace detail {
+
+inline tessellate::Mesh2D triangulateTiled(const clipper::Paths& region) {
+	const size_t nv = clipper::vertexCount(region);
+
+	if(nv <= TILE_VERTICES * 2) return tessellate::triangulate(region);
+
+	double x0 = std::numeric_limits<double>::max(), y0 = x0;
+	double x1 = std::numeric_limits<double>::lowest(), y1 = x1;
+
+	for(const auto& p : region) for(const auto& pt : p) {
+		x0 = std::min(x0, pt.x); y0 = std::min(y0, pt.y);
+		x1 = std::max(x1, pt.x); y1 = std::max(y1, pt.y);
+	}
+
+	const auto n = static_cast<size_t>(std::ceil(std::sqrt(double(nv) / double(TILE_VERTICES))));
+	const double tw = (x1 - x0) / double(n), th = (y1 - y0) / double(n);
+	const int precision = clipper::precisionFor(region);
+
+	tessellate::Mesh2D out;
+
+	for(size_t j = 0; j < n; j++) {
+		for(size_t i = 0; i < n; i++) {
+			const Clipper2Lib::RectD rect(
+				x0 + tw * double(i), y0 + th * double(j),
+				i + 1 == n ? x1 : x0 + tw * double(i + 1),
+				j + 1 == n ? y1 : y0 + th * double(j + 1)
+			);
+
+			const clipper::Paths tile = Clipper2Lib::RectClip(rect, region, precision);
+
+			if(tile.empty()) continue;
+
+			const tessellate::Mesh2D m = tessellate::triangulate(tile);
+			const auto base = static_cast<uint32_t>(out.positions.size() / 2);
+
+			out.positions.insert(out.positions.end(), m.positions.begin(), m.positions.end());
+
+			for(uint32_t idx : m.indices) out.indices.push_back(base + idx);
+		}
+	}
+
+	return out;
+}
+
 inline Paint paintOf(const Atlas& atlas, const Layer& layer, const LayerSource& src, slug_t opaqueAlpha) {
 	Paint p;
 
@@ -549,29 +606,116 @@ inline BakedMesh bakeMesh(
 
 		const Paint paint = detail::paintOf(atlas, layer, src, cfg.opaqueAlpha);
 
-		mesh.trianglesBefore += tessellate::triangulate(paths).indices.size() / 3;
+		mesh.trianglesBefore += detail::triangulateTiled(paths).indices.size() / 3;
 
 		regions.push_back({li, std::move(paths), paint.opaque});
 	}
 
-	// Planarize: top -> bottom, subtract the union of opaque layers above.
+	// Tile the canvas: every region is cut (Clipper2 RectClip, holes stay holes) into a grid of
+	// tiles sized to ~PLANAR_TILE_VERTICES vertices, and planarization + triangulation run per
+	// tile. Without tiling, a big merged region pays for every occluder above it anywhere on the
+	// canvas, which is quadratic in practice (the station's text / speckle atlases). Clipping to
+	// the canvas rectangle is also the canvas's own semantics (nothing draws outside it).
+	struct Piece {
+		size_t tile;
+		clipper::Paths paths;
+		detail::Box box;
+	};
+
+	auto boxOf = [](const clipper::Paths& paths) {
+		detail::Box b;
+
+		for(const auto& p : paths) for(const auto& pt : p) b.add(static_cast<slug_t>(pt.x), static_cast<slug_t>(pt.y));
+
+		return b;
+	};
+
+	size_t totalVerts = 0;
+
+	for(const auto& r : regions) totalVerts += clipper::vertexCount(r.paths);
+
+	const auto G = std::clamp<size_t>(
+		static_cast<size_t>(std::ceil(std::sqrt(double(totalVerts) / double(PLANAR_TILE_VERTICES)))), 1, 32
+	);
+
+	const double tw = double(cfg.width) / double(G), th = double(cfg.height) / double(G);
+
+	std::vector<std::vector<Piece>> pieces(regions.size());
+
+	for(size_t ri = 0; ri < regions.size(); ri++) {
+		const detail::Box b = boxOf(regions[ri].paths);
+		const int precision = clipper::precisionFor(regions[ri].paths);
+
+		const auto i0 = static_cast<size_t>(std::clamp(std::floor(double(b.x0) / tw), 0.0, double(G - 1)));
+		const auto i1 = static_cast<size_t>(std::clamp(std::floor(double(b.x1) / tw), 0.0, double(G - 1)));
+		const auto j0 = static_cast<size_t>(std::clamp(std::floor(double(b.y0) / th), 0.0, double(G - 1)));
+		const auto j1 = static_cast<size_t>(std::clamp(std::floor(double(b.y1) / th), 0.0, double(G - 1)));
+
+		for(size_t j = j0; j <= j1; j++) {
+			for(size_t i = i0; i <= i1; i++) {
+				const Clipper2Lib::RectD rect(tw * double(i), th * double(j), tw * double(i + 1), th * double(j + 1));
+
+				clipper::Paths piece = Clipper2Lib::RectClip(rect, regions[ri].paths, precision);
+
+				if(piece.empty()) continue;
+
+				const detail::Box pb = boxOf(piece);
+
+				pieces[ri].push_back({j * G + i, std::move(piece), pb});
+			}
+		}
+	}
+
+	// Planarize, per tile: top -> bottom, subtract every opaque piece above. Pieces are
+	// normalized (every covered point has winding exactly 1, holes included), so a plain
+	// concatenation of several IS their union under the nonzero rule - no incremental union.
 	if(cfg.planarize) {
-		clipper::Paths occluder;
+		struct Occluder {
+			clipper::Paths paths;
+			detail::Box box;
+		};
+
+		std::vector<std::vector<Occluder>> occluders(G * G);
 
 		for(size_t ri = regions.size(); ri-- > 0;) {
-			Region& r = regions[ri];
-			clipper::Paths full = r.paths;
+			for(Piece& pc : pieces[ri]) {
+				auto& occ = occluders[pc.tile];
+				clipper::Paths full = regions[ri].opaque ? pc.paths : clipper::Paths{};
+				clipper::Paths clips;
 
-			if(!occluder.empty()) r.paths = clipper::difference(r.paths, occluder);
+				for(const auto& o : occ) {
+					if(o.box.x0 <= pc.box.x1 && pc.box.x0 <= o.box.x1 && o.box.y0 <= pc.box.y1 && pc.box.y0 <= o.box.y1) {
+						clips.insert(clips.end(), o.paths.begin(), o.paths.end());
+					}
+				}
 
-			if(r.opaque) occluder = clipper::unite(occluder, full);
+				if(!clips.empty()) pc.paths = clipper::difference(pc.paths, clips);
+
+				if(regions[ri].opaque) occ.push_back({std::move(full), pc.box});
+			}
 		}
 	}
 
 	std::vector<uint32_t> overlay;
 
-	for(const Region& r : regions) {
-		if(r.paths.empty()) continue;
+	for(size_t ri = 0; ri < regions.size(); ri++) {
+		const Region& r = regions[ri];
+
+		// Triangulate this region's surviving pieces (tile by tile).
+		tessellate::Mesh2D tri;
+
+		for(const Piece& pc : pieces[ri]) {
+			if(pc.paths.empty()) continue;
+
+			const tessellate::Mesh2D m = detail::triangulateTiled(pc.paths);
+			const auto off = static_cast<uint32_t>(tri.positions.size() / 2);
+
+			tri.positions.insert(tri.positions.end(), m.positions.begin(), m.positions.end());
+
+			for(uint32_t idx : m.indices) tri.indices.push_back(off + idx);
+		}
+
+		if(tri.indices.empty()) continue;
 
 		const Layer& layer = composite.layers[r.layer];
 		const LayerSource src = r.layer < meta.size() ? meta[r.layer] : LayerSource{};
@@ -586,7 +730,6 @@ inline BakedMesh bakeMesh(
 			: nullptr
 		;
 
-		const tessellate::Mesh2D tri = tessellate::triangulate(r.paths);
 		const auto base = static_cast<uint32_t>(mesh.positions.size() / 2);
 
 		const slug_t s = layer.scale;
@@ -656,13 +799,14 @@ inline BakedMesh bakeMesh(
 			uint32_t a = base + tri.indices[t], b = base + tri.indices[t + 1], c = base + tri.indices[t + 2];
 
 			const float* P = mesh.positions.data();
-			const float area2 =
-				(P[b * 2] - P[a * 2]) * (P[c * 2 + 1] - P[a * 2 + 1]) -
-				(P[c * 2] - P[a * 2]) * (P[b * 2 + 1] - P[a * 2 + 1])
+			const double area2 =
+				(double(P[b * 2]) - P[a * 2]) * (double(P[c * 2 + 1]) - P[a * 2 + 1]) -
+				(double(P[c * 2]) - P[a * 2]) * (double(P[b * 2 + 1]) - P[a * 2 + 1])
 			;
 
-			// Enforce CCW in the emitted (u, v) plane.
-			if(area2 < 0.0f) std::swap(b, c);
+			// Drop triangles that are degenerate at float precision; enforce CCW in (u, v).
+			if(area2 == 0.0) continue;
+			if(area2 < 0.0) std::swap(b, c);
 
 			dstIdx.push_back(a);
 			dstIdx.push_back(b);

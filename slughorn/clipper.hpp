@@ -31,6 +31,10 @@
 __pragma(warning(disable: 4702))
 #endif
 
+// Clipper2 1.5.4's clipper.core.h uses std::back_inserter without including <iterator>; MSVC's STL
+// pulls it in transitively, libstdc++ / libc++ do not.
+#include <iterator>
+
 #include <clipper2/clipper.h>
 
 #include <algorithm>
