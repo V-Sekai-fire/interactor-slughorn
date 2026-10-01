@@ -58,6 +58,7 @@ void bind_bake(py::module_& bake) {
 		.def_readwrite("tolerance_px", &BakeConfig::tolerancePx)
 		.def_readwrite("opaque_alpha", &BakeConfig::opaqueAlpha)
 		.def_readwrite("planarize", &BakeConfig::planarize)
+		.def_readwrite("alpha_test", &BakeConfig::alphaTest, "> 0: cutout (alpha-tested) bake, see bake.hpp bakeCutout().")
 	;
 
 	py::class_<BakedMesh>(bake, "BakedMesh")
@@ -119,13 +120,19 @@ void bind_bake(py::module_& bake) {
 		"layers where painter's order allows. Returns a MergeResult."
 	);
 
-	bake.def("bake_mesh", &bakeMesh,
+	bake.def("bake_mesh",
+		[](const slughorn::Atlas& atlas, const slughorn::CompositeShape& composite, const std::vector<LayerSource>& meta, const BakeConfig& config) {
+			return bakeMesh(atlas, composite, meta, config);
+		},
 		"atlas"_a, "composite"_a, "meta"_a, "config"_a,
 		"Tessellate every layer's contours (fill-rule normalized) and planarize painter's order\n"
 		"into one opaque triangle set plus an overlay range. Returns a BakedMesh."
 	);
 
-	bake.def("cost", &cost,
+	bake.def("cost",
+		[](const slughorn::Atlas& atlas, const slughorn::CompositeShape& composite, const BakedMesh& mesh, size_t layersBefore, slug_t w, slug_t h) {
+			return cost(atlas, composite, mesh, layersBefore, w, h);
+		},
 		"atlas"_a, "composite"_a, "mesh"_a, "layers_before"_a, "canvas_em_w"_a=0_cv, "canvas_em_h"_a=0_cv,
 		"Curve/band statistics (atlas must be built) + triangle counts + recommended mode."
 	);

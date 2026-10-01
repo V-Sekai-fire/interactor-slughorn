@@ -568,6 +568,8 @@ if(SLUGHORN_BUILD_TESTS)
 		add_executable(slughorn-test-thorvg "test/slughorn-test-thorvg.cpp")
 		target_link_libraries(slughorn-test-thorvg PRIVATE slughorn)
 		target_compile_options(slughorn-test-thorvg PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+		# stb_image_write (contact sheets) ships with the NanoSVG submodule's examples.
+		target_include_directories(slughorn-test-thorvg PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/ext/nanosvg/example")
 		add_test(NAME thorvg COMMAND slughorn-test-thorvg)
 		message(STATUS "slughorn tests: ThorVG enabled, building slughorn-test-thorvg")
 	else()

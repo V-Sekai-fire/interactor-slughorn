@@ -656,6 +656,107 @@ inline Color gradientColor(const GradientInfo& g, slug_t t) {
 	return g.stops.back().color;
 }
 
+// The em-space window an Image samples (see renderComposite()). linear: colors and gradient
+// stops go through the sRGB EOTF before compositing (alpha unchanged), so the image is composited
+// in linear light like a GPU fed linear colors (the slug.elf wire); default: as authored.
+struct Window {
+	slug_t emX0 = 0_cv, emY0 = 0_cv;
+	slug_t emWidth = 1_cv, emHeight = 1_cv;
+	bool linear = false;
+};
+
+inline slug_t srgbToLinear(slug_t c) {
+	c = std::clamp(c, 0_cv, 1_cv);
+
+	return c <= 0.04045_cv ? c / 12.92_cv : slug_t(std::pow((c + 0.055_cv) / 1.055_cv, 2.4_cv));
+}
+
+inline Color toLinear(const Color& c) { return {srgbToLinear(c.r), srgbToLinear(c.g), srgbToLinear(c.b), c.a}; }
+
+inline GradientInfo toLinear(GradientInfo g) {
+	for(auto& st : g.stops) st.color = toLinear(st.color);
+
+	return g;
+}
+
+// Premultiplied src-over of straight color @p c at coverage @p cov into pixel (i, j).
+inline void blendPixel(Image& img, uint32_t i, uint32_t j, const Color& c, slug_t cov) {
+	const slug_t a = c.a * cov;
+	slug_t* d = &img.data[(size_t(j) * img.width + size_t(i)) * 4];
+
+	d[0] = c.r * a + d[0] * (1_cv - a);
+	d[1] = c.g * a + d[1] * (1_cv - a);
+	d[2] = c.b * a + d[2] * (1_cv - a);
+	d[3] = a + d[3] * (1_cv - a);
+}
+
+// Composites one ordinary (shape-backed) layer into @p img. Layers with no shape in the atlas
+// are skipped (renderComposite() callers that know other layer kinds - slughorn/stamp.hpp -
+// handle those themselves).
+inline void renderLayer(Image& img, const Atlas& atlas, const Layer& layer, const Window& win) {
+	if(layer.drawMode != DrawMode::Visible || !img.width || !img.height) return;
+
+	const auto info = atlas.getShape(layer.key);
+
+	if(!info || info->curves.empty()) return;
+
+	const slug_t ppeX = cv(img.width) / win.emWidth;
+	const slug_t ppeY = cv(img.height) / win.emHeight;
+	const auto& gradients = atlas.getGradients();
+
+	const Sampler sampler = decode(atlas, layer.key);
+	const Atlas::Shape& sh = sampler.shape;
+	const slug_t s = layer.scale;
+
+	// Local (curve-space) = (canvas - placement) / scale; placement per Shape::computeQuad.
+	const slug_t px = (layer.transform.x - sh.originX) * s;
+	const slug_t py = (layer.transform.y - sh.originY) * s;
+
+	const Quad q = sh.computeQuad(layer.transform, s);
+
+	const GradientInfo* grad = (layer.gradientId > 0 && layer.gradientId <= gradients.size())
+		? &gradients[layer.gradientId - 1]
+		: nullptr
+	;
+
+	GradientInfo linearGrad;
+
+	if(grad && win.linear) {
+		linearGrad = toLinear(*grad);
+		grad = &linearGrad;
+	}
+
+	const Color layerColor = win.linear ? toLinear(layer.color) : layer.color;
+
+	const auto i0 = static_cast<int64_t>(std::floor((q.x0 - win.emX0) * ppeX)) - 1;
+	const auto i1 = static_cast<int64_t>(std::ceil((q.x1 - win.emX0) * ppeX)) + 1;
+	const auto j0 = static_cast<int64_t>(std::floor((q.y0 - win.emY0) * ppeY)) - 1;
+	const auto j1 = static_cast<int64_t>(std::ceil((q.y1 - win.emY0) * ppeY)) + 1;
+
+	for(int64_t j = std::max<int64_t>(j0, 0); j < std::min<int64_t>(j1, img.height); j++) {
+		for(int64_t i = std::max<int64_t>(i0, 0); i < std::min<int64_t>(i1, img.width); i++) {
+			const slug_t ex = win.emX0 + (cv(i) + 0.5_cv) / ppeX;
+			const slug_t ey = win.emY0 + (cv(j) + 0.5_cv) / ppeY;
+			const slug_t lx = (ex - px) / s;
+			const slug_t ly = (ey - py) / s;
+
+			const slug_t cov = std::clamp(sampler.renderSampleBanded(lx, ly, ppeX * s, ppeY * s).fill, 0_cv, 1_cv);
+
+			if(cov <= 0_cv) continue;
+
+			Color c = layerColor;
+
+			if(grad) {
+				const Color gc = gradientColor(*grad, gradientT(*grad, lx, ly));
+
+				c = { gc.r, gc.g, gc.b, gc.a * layer.color.a };
+			}
+
+			blendPixel(img, uint32_t(i), uint32_t(j), c, cov);
+		}
+	}
+}
+
 inline Image renderComposite(
 	const Atlas& atlas,
 	const CompositeShape& composite,
@@ -664,72 +765,16 @@ inline Image renderComposite(
 	slug_t emX0=0_cv,
 	slug_t emY0=0_cv,
 	slug_t emWidth=1_cv,
-	slug_t emHeight=1_cv
+	slug_t emHeight=1_cv,
+	bool linear=false
 ) {
 	Image img{width, height, std::vector<slug_t>(size_t(width) * height * 4, 0_cv)};
 
 	if(!width || !height || emWidth <= 0_cv || emHeight <= 0_cv) return img;
 
-	const slug_t ppeX = cv(width) / emWidth;
-	const slug_t ppeY = cv(height) / emHeight;
-	const auto& gradients = atlas.getGradients();
+	const Window win{emX0, emY0, emWidth, emHeight, linear};
 
-	for(const auto& layer : composite.layers) {
-		if(layer.drawMode != DrawMode::Visible) continue;
-
-		const auto info = atlas.getShape(layer.key);
-
-		if(!info || info->curves.empty()) continue;
-
-		const Sampler sampler = decode(atlas, layer.key);
-		const Atlas::Shape& sh = sampler.shape;
-		const slug_t s = layer.scale;
-
-		// Local (curve-space) = (canvas - placement) / scale; placement per Shape::computeQuad.
-		const slug_t px = (layer.transform.x - sh.originX) * s;
-		const slug_t py = (layer.transform.y - sh.originY) * s;
-
-		const Quad q = sh.computeQuad(layer.transform, s);
-
-		const GradientInfo* grad = (layer.gradientId > 0 && layer.gradientId <= gradients.size())
-			? &gradients[layer.gradientId - 1]
-			: nullptr
-		;
-
-		const auto i0 = static_cast<int64_t>(std::floor((q.x0 - emX0) * ppeX)) - 1;
-		const auto i1 = static_cast<int64_t>(std::ceil((q.x1 - emX0) * ppeX)) + 1;
-		const auto j0 = static_cast<int64_t>(std::floor((q.y0 - emY0) * ppeY)) - 1;
-		const auto j1 = static_cast<int64_t>(std::ceil((q.y1 - emY0) * ppeY)) + 1;
-
-		for(int64_t j = std::max<int64_t>(j0, 0); j < std::min<int64_t>(j1, height); j++) {
-			for(int64_t i = std::max<int64_t>(i0, 0); i < std::min<int64_t>(i1, width); i++) {
-				const slug_t ex = emX0 + (cv(i) + 0.5_cv) / ppeX;
-				const slug_t ey = emY0 + (cv(j) + 0.5_cv) / ppeY;
-				const slug_t lx = (ex - px) / s;
-				const slug_t ly = (ey - py) / s;
-
-				const slug_t cov = std::clamp(sampler.renderSampleBanded(lx, ly, ppeX * s, ppeY * s).fill, 0_cv, 1_cv);
-
-				if(cov <= 0_cv) continue;
-
-				Color c = layer.color;
-
-				if(grad) {
-					const Color gc = gradientColor(*grad, gradientT(*grad, lx, ly));
-
-					c = { gc.r, gc.g, gc.b, gc.a * layer.color.a };
-				}
-
-				const slug_t a = c.a * cov;
-				slug_t* d = &img.data[(size_t(j) * width + size_t(i)) * 4];
-
-				d[0] = c.r * a + d[0] * (1_cv - a);
-				d[1] = c.g * a + d[1] * (1_cv - a);
-				d[2] = c.b * a + d[2] * (1_cv - a);
-				d[3] = a + d[3] * (1_cv - a);
-			}
-		}
-	}
+	for(const auto& layer : composite.layers) renderLayer(img, atlas, layer, win);
 
 	return img;
 }

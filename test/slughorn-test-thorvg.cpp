@@ -40,9 +40,11 @@
 
 #if defined(SLUGHORN_HAS_CLIPPER2) && defined(SLUGHORN_HAS_TESSELLATE)
 #include "slughorn/bake.hpp"
+#include "slughorn/stamp.hpp"
 #include "slughorn/tessellate.hpp"
 #endif
 
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -469,12 +471,14 @@ void test_IdsRulesStrokes() {
 struct Diff {
 	double mean = 0.0;   // mean |delta| over all RGBA channels
 	double bad = 0.0;    // fraction of pixels whose max channel |delta| > 0.25
+	size_t flips = 0;    // pixels whose max channel |delta| > 0.5
+	double maxd = 0.0;   // largest channel |delta| anywhere
 };
 
 static Diff compare(const std::vector<slug_t>& a, const std::vector<slug_t>& b) {
 	Diff d;
 
-	if(a.size() != b.size() || a.empty()) return {1.0, 1.0};
+	if(a.size() != b.size() || a.empty()) return {1.0, 1.0, a.size(), 1.0};
 
 	size_t badCount = 0;
 
@@ -489,6 +493,8 @@ static Diff compare(const std::vector<slug_t>& a, const std::vector<slug_t>& b) 
 		}
 
 		if(mx > 0.25) badCount++;
+		if(mx > 0.5) d.flips++;
+		d.maxd = std::max(d.maxd, mx);
 	}
 
 	d.mean /= double(a.size());
@@ -874,6 +880,11 @@ void test_Bake() {
 }
 #endif
 
+#if defined(SLUGHORN_HAS_CLIPPER2) && defined(SLUGHORN_HAS_TESSELLATE)
+#include "slughorn-test-thorvg-stamp.inl"
+#include "slughorn-test-thorvg-sheet.inl"
+#endif
+
 // =============================================================================
 // dumpSVGFile
 // =============================================================================
@@ -949,6 +960,10 @@ int compareSVGFiles(int argc, char** argv) {
 
 int main(int argc, char** argv) {
 	if(argc >= 3 && std::string(argv[1]) == "--compare") return compareSVGFiles(argc, argv);
+#if defined(SLUGHORN_HAS_CLIPPER2) && defined(SLUGHORN_HAS_TESSELLATE)
+	if(argc >= 3 && std::string(argv[1]) == "--stamp-compare") return stampCompareFiles(argc, argv);
+	if(argc >= 4 && std::string(argv[1]) == "--contact-sheet") return contactSheets(argc, argv);
+#endif
 
 	if(argc >= 2) {
 		for(int i = 1; i < argc; i++) dumpSVGFile(argv[i]);
@@ -967,6 +982,9 @@ int main(int argc, char** argv) {
 #if defined(SLUGHORN_HAS_CLIPPER2) && defined(SLUGHORN_HAS_TESSELLATE)
 	test_MisWound();
 	test_Bake();
+	test_StampThorvgCaveats();
+	test_Stamp();
+	test_Cutout();
 #endif
 
 	std::cout

@@ -31,8 +31,12 @@
 #include "clipper.hpp"
 #include "render.hpp"
 #include "tessellate.hpp"
+#include "stamp.hpp"
 
 #include <algorithm>
+#include <array>
+#include <map>
+#include <optional>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -211,6 +215,7 @@ inline MergeResult mergeLayers(
 		Atlas::Curves curves;
 		std::vector<size_t> starts;
 		bool polygonal = true;
+		bool stamp = false;
 	};
 
 	MergeResult result;
@@ -221,6 +226,22 @@ inline MergeResult mergeLayers(
 	for(size_t li = 0; li < in.layers.size(); li++) {
 		const Layer& layer = in.layers[li];
 		const LayerSource source = li < meta.size() ? meta[li] : LayerSource{};
+
+		// Stamp layers (stamp.hpp placeholders) pass through untouched and block merging across
+		// them (their extent is not known here).
+		if(stamp::isStampLayer(layer)) {
+			Group g;
+
+			g.layer = layer;
+			g.source = source;
+			g.stamp = true;
+			g.box = Box{-1e30_cv, -1e30_cv, 1e30_cv, 1e30_cv};
+			g.memberBoxes.push_back(g.box);
+
+			groups.push_back(std::move(g));
+
+			continue;
+		}
 
 		Placed p = place(src, layer);
 
@@ -309,6 +330,13 @@ inline MergeResult mergeLayers(
 	const auto& gradients = src.getGradients();
 
 	for(auto& g : groups) {
+		if(g.stamp) {
+			result.composite.layers.push_back(g.layer);
+			result.layers.push_back(g.source);
+
+			continue;
+		}
+
 		// Straight-edged multi-member groups: replace the concatenation by the exact union (no
 		// flattening involved - every edge is already a line), when that is smaller.
 		if(g.mergeable && g.polygonal && g.memberBoxes.size() > 1) {
@@ -429,6 +457,9 @@ struct BakeConfig {
 	// Output v axis: false = v down (v = y / height, SVG / image orientation), true = v up
 	// (v = 1 - y / height, the three.js / OpenGL texture convention).
 	bool vUp = false;
+
+	// > 0: alpha-tested (cutout) bake - see bakeCutout(). 0: the planar base + overlay bake.
+	slug_t alphaTest = 0_cv;
 };
 
 struct BakedMesh {
@@ -460,6 +491,11 @@ struct BakedMesh {
 	size_t strokeLayers = 0;
 
 	slug_t tolerancePx = 0_cv;
+
+	// Cutout bakes: the alpha test used (0 for the planar bake) and how many arrangement faces had
+	// to be approximated at their centroid (stacks with two or more gradients).
+	slug_t alphaTest = 0_cv;
+	size_t cutoutApproxFaces = 0;
 };
 
 namespace detail {
@@ -553,6 +589,612 @@ inline Paint paintOf(const Atlas& atlas, const Layer& layer, const LayerSource& 
 
 }
 
+// ================================================================================================
+// bakeCutout - alpha-tested bake (what three.js alphaTest does with the original canvas)
+//
+// The key's layers (stamp instances included) are cut into their full planar arrangement: every
+// face of it is covered by a fixed stack of layers. Each face's source-over composite is known in
+// closed form, so a face is KEPT, as fully opaque geometry with the unpremultiplied composite
+// color, exactly where its composite alpha >= alphaTest, and dropped elsewhere. No overlay.
+//
+// - Faces whose stack is all solid paints: constant composite; kept or dropped whole.
+// - Faces with exactly one gradient (linear / radial / elliptical) and solids around it: the
+//   composite alpha is piecewise linear in the gradient parameter t (between stops), so the
+//   alphaTest iso-lines are lines of constant t: straight lines for a linear gradient (the face is
+//   clipped by half-planes, exact) and ellipses for a radial one (clipped by an annulus polygon at
+//   the bake tolerance). The kept part gets a gradient paint whose stops are the composite color
+//   at every original stop and crossing point (exact at those t, linear in between).
+// - Faces under two or more gradients (or a sweep): no closed form; subdivided into
+//   CUTOUT_CELL_PX cells, each kept / dropped with the composite at its center - counted in
+//   BakedMesh::cutoutApproxFaces.
+// ================================================================================================
+
+namespace detail {
+
+// How one region paints, in authoring pixels.
+struct CutPaint {
+	const GradientInfo* g = nullptr; // nullptr = solid
+	Color color = {};                // solid straight color, or the gradient tint
+	Matrix toLocal = {};             // px -> the space GradientInfo lives in
+};
+
+inline Color paintColorAt(const CutPaint& p, double px, double py) {
+	if(!p.g) return p.color;
+
+	slug_t lx, ly;
+
+	p.toLocal.apply(slug_t(px), slug_t(py), lx, ly);
+
+	const Color c = render::gradientColor(*p.g, render::gradientT(*p.g, lx, ly));
+
+	return {c.r * p.color.r, c.g * p.color.g, c.b * p.color.b, c.a * p.color.a};
+}
+
+inline Color paintColorAtT(const CutPaint& p, double t) {
+	const Color c = render::gradientColor(*p.g, slug_t(t));
+
+	return {c.r * p.color.r, c.g * p.color.g, c.b * p.color.b, c.a * p.color.a};
+}
+
+struct Premul {
+	double r = 0, g = 0, b = 0, a = 0;
+
+	void over(const Color& c) { // this = c over this
+		const double ca = c.a;
+
+		r = c.r * ca + r * (1 - ca);
+		g = c.g * ca + g * (1 - ca);
+		b = c.b * ca + b * (1 - ca);
+		a = ca + a * (1 - ca);
+	}
+};
+
+// Convex polygon (px) of points with lo <= alpha*x + beta*y + gamma <= hi, inside @p box.
+inline clipper::Path slab(double alpha, double beta, double gamma, double lo, double hi, double x0, double y0, double x1, double y1) {
+	clipper::Path poly{{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}};
+
+	auto clip = [&](double sgn, double bound) { // keep sgn * (f - bound) >= 0
+		clipper::Path out;
+
+		for(size_t i = 0; i < poly.size(); i++) {
+			const auto& p = poly[i];
+			const auto& q = poly[(i + 1) % poly.size()];
+			const double fp = sgn * (alpha * p.x + beta * p.y + gamma - bound);
+			const double fq = sgn * (alpha * q.x + beta * q.y + gamma - bound);
+
+			if(fp >= 0) out.push_back(p);
+			if((fp >= 0) != (fq >= 0)) {
+				const double u = fp / (fp - fq);
+
+				out.push_back({p.x + (q.x - p.x) * u, p.y + (q.y - p.y) * u});
+			}
+		}
+
+		poly = std::move(out);
+	};
+
+	if(std::isfinite(lo)) clip(1.0, lo);
+	if(std::isfinite(hi) && !poly.empty()) clip(-1.0, hi);
+
+	return poly;
+}
+
+}
+
+// Cell size (authoring px) for cutout faces under two or more gradients (no closed-form iso-line).
+inline constexpr double CUTOUT_CELL_PX = 1.0;
+
+inline BakedMesh bakeCutout(
+	const Atlas& atlas,
+	const CompositeShape& composite,
+	const std::vector<LayerSource>& meta,
+	const BakeConfig& cfg,
+	const stamp::Set* stamps=nullptr
+) {
+	using detail::CutPaint;
+	using detail::Premul;
+
+	BakedMesh mesh;
+
+	mesh.tolerancePx = cfg.tolerancePx;
+	mesh.alphaTest = cfg.alphaTest;
+
+	const slug_t ppe = cfg.width;
+	const auto& gradients = atlas.getGradients();
+
+	struct Region {
+		clipper::Paths paths;
+		CutPaint paint;
+	};
+
+	std::vector<Region> regions;
+
+	for(size_t li = 0; li < composite.layers.size(); li++) {
+		const Layer& layer = composite.layers[li];
+
+		if(layer.drawMode != DrawMode::Visible) continue;
+
+		if(stamp::isStampLayer(layer)) {
+			if(!stamps || stamp::stampIndex(layer) >= stamps->layers.size()) continue;
+
+			for(const stamp::Instance& in : stamps->layers[stamp::stampIndex(layer)].instances) {
+				if(in.color.a <= 0_cv) continue;
+
+				auto paths = clipper::normalize(
+					clipper::toPaths(stamp::instanceContours(*stamps, in), cfg.tolerancePx, Matrix::scale(ppe, ppe)),
+					FillRule::NonZero
+				);
+
+				if(paths.empty()) continue;
+
+				CutPaint p;
+
+				p.color = in.color;
+
+				if(in.gradient && in.gradient <= stamps->gradients.size()) {
+					const stamp::Inverse inv = stamp::invert(in.m);
+
+					p.g = &stamps->gradients[in.gradient - 1];
+					p.toLocal = Matrix{.xx = inv.a / ppe, .yx = inv.c / ppe, .xy = inv.b / ppe, .yy = inv.d / ppe, .dx = inv.e, .dy = inv.f};
+				}
+
+				mesh.trianglesBefore += detail::triangulateTiled(paths).indices.size() / 3;
+				regions.push_back({std::move(paths), p});
+			}
+
+			continue;
+		}
+
+		const auto shape = atlas.getShape(layer.key);
+
+		if(!shape) continue;
+
+		const LayerSource src = li < meta.size() ? meta[li] : LayerSource{};
+
+		if(src.stroke) mesh.strokeLayers++;
+
+		const slug_t s = layer.scale;
+		const slug_t ox = (layer.transform.x - shape->originX) * s;
+		const slug_t oy = (layer.transform.y - shape->originY) * s;
+
+		auto paths = clipper::normalize(
+			clipper::toPaths(atlas.getShapeContours(layer.key), cfg.tolerancePx, Matrix{.xx = s * ppe, .yy = s * ppe, .dx = ox * ppe, .dy = oy * ppe}),
+			src.fillRule
+		);
+
+		if(paths.empty()) continue;
+
+		CutPaint p;
+
+		p.color = layer.color;
+
+		if(layer.gradientId > 0 && layer.gradientId <= gradients.size()) {
+			p.g = &gradients[layer.gradientId - 1];
+			// local = (px / ppe - o) / s
+			p.toLocal = Matrix{.xx = 1_cv / (ppe * s), .yy = 1_cv / (ppe * s), .dx = -ox / s, .dy = -oy / s};
+		}
+
+		mesh.trianglesBefore += detail::triangulateTiled(paths).indices.size() / 3;
+		regions.push_back({std::move(paths), p});
+	}
+
+	// Tiles, as in bakeMesh().
+	auto boxOf = [](const clipper::Paths& paths) {
+		detail::Box b;
+
+		for(const auto& p : paths) for(const auto& pt : p) b.add(static_cast<slug_t>(pt.x), static_cast<slug_t>(pt.y));
+
+		return b;
+	};
+
+	size_t totalVerts = 0;
+
+	for(const auto& r : regions) totalVerts += clipper::vertexCount(r.paths);
+
+	const auto G = std::clamp<size_t>(static_cast<size_t>(std::ceil(std::sqrt(double(totalVerts) / double(PLANAR_TILE_VERTICES)))), 1, 32);
+	const double tw = double(cfg.width) / double(G), th = double(cfg.height) / double(G);
+
+	struct Face {
+		clipper::Paths paths;
+		detail::Box box;
+		std::vector<uint32_t> stack; // region indices, bottom -> top
+	};
+
+	std::vector<std::vector<Face>> tiles(G * G);
+
+	auto overlap = [](const detail::Box& a, const detail::Box& b) {
+		return a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1;
+	};
+
+	for(uint32_t ri = 0; ri < regions.size(); ri++) {
+		const detail::Box rb = boxOf(regions[ri].paths);
+		const int precision = clipper::precisionFor(regions[ri].paths);
+
+		const auto i0 = static_cast<size_t>(std::clamp(std::floor(double(rb.x0) / tw), 0.0, double(G - 1)));
+		const auto i1 = static_cast<size_t>(std::clamp(std::floor(double(rb.x1) / tw), 0.0, double(G - 1)));
+		const auto j0 = static_cast<size_t>(std::clamp(std::floor(double(rb.y0) / th), 0.0, double(G - 1)));
+		const auto j1 = static_cast<size_t>(std::clamp(std::floor(double(rb.y1) / th), 0.0, double(G - 1)));
+
+		for(size_t j = j0; j <= j1; j++) {
+			for(size_t i = i0; i <= i1; i++) {
+				const Clipper2Lib::RectD rect(tw * double(i), th * double(j), tw * double(i + 1), th * double(j + 1));
+				const clipper::Paths piece = Clipper2Lib::RectClip(rect, regions[ri].paths, precision);
+
+				if(piece.empty()) continue;
+
+				const detail::Box pb = boxOf(piece);
+				auto& faces = tiles[j * G + i];
+				std::vector<Face> next;
+				clipper::Paths covered;
+
+				next.reserve(faces.size() + 2);
+
+				for(Face& f : faces) {
+					if(!overlap(f.box, pb)) { next.push_back(std::move(f)); continue; }
+
+					clipper::Paths inter = clipper::intersect(f.paths, piece);
+
+					if(inter.empty()) { next.push_back(std::move(f)); continue; }
+
+					covered.insert(covered.end(), f.paths.begin(), f.paths.end());
+
+					clipper::Paths rest = clipper::difference(f.paths, piece);
+
+					if(!rest.empty()) next.push_back({rest, boxOf(rest), f.stack});
+
+					std::vector<uint32_t> stack = f.stack;
+
+					stack.push_back(ri);
+					next.push_back({inter, boxOf(inter), std::move(stack)});
+				}
+
+				clipper::Paths uncovered = covered.empty() ? piece : clipper::difference(piece, covered);
+
+				if(!uncovered.empty()) next.push_back({uncovered, boxOf(uncovered), {ri}});
+
+				faces = std::move(next);
+			}
+		}
+	}
+
+	// Keep / drop faces.
+	const double test = cfg.alphaTest;
+	std::map<std::array<int64_t, 3>, uint16_t> solidIds;
+
+	struct Kept {
+		clipper::Paths paths;
+		uint16_t paint;
+		const CutPaint* gradient; // for the per-vertex parameter
+	};
+
+	std::vector<Kept> kept;
+
+	auto solidPaint = [&](double r, double g, double b) {
+		const std::array<int64_t, 3> k{std::llround(r * 65536), std::llround(g * 65536), std::llround(b * 65536)};
+		auto it = solidIds.find(k);
+
+		if(it != solidIds.end()) return it->second;
+
+		Paint p;
+
+		p.color = {slug_t(r), slug_t(g), slug_t(b), 1_cv};
+		p.opaque = true;
+
+		const auto id = static_cast<uint16_t>(mesh.paints.size());
+
+		mesh.paints.push_back(p);
+		solidIds[k] = id;
+
+		return id;
+	};
+
+	for(const auto& faces : tiles) {
+		for(const Face& f : faces) {
+			int gradientCount = 0;
+			int gradientAt = -1;
+
+			for(size_t k = 0; k < f.stack.size(); k++) {
+				if(regions[f.stack[k]].paint.g) { gradientCount++; gradientAt = int(k); }
+			}
+
+			const bool sweep = gradientAt >= 0 && regions[f.stack[size_t(gradientAt)]].paint.g->type == GradientInfo::Type::Sweep;
+
+			auto compositeAt2 = [&](double x, double y) {
+				Premul c;
+
+				for(uint32_t ri : f.stack) c.over(detail::paintColorAt(regions[ri].paint, x, y));
+
+				return c;
+			};
+
+			if(gradientCount == 0) {
+				const Premul c = compositeAt2((double(f.box.x0) + f.box.x1) * 0.5, (double(f.box.y0) + f.box.y1) * 0.5);
+
+				if(c.a >= test && c.a > 0) kept.push_back({f.paths, solidPaint(c.r / c.a, c.g / c.a, c.b / c.a), nullptr});
+
+				continue;
+			}
+
+			if(gradientCount > 1 || sweep) {
+				// No closed form: subdivide into CUTOUT_CELL_PX cells, each kept / dropped at its center
+				// with its center color (the alphaTest edge is then within half a cell).
+				mesh.cutoutApproxFaces++;
+
+				const int precision = clipper::precisionFor(f.paths);
+
+				for(double y = std::floor(double(f.box.y0)); y < double(f.box.y1); y += CUTOUT_CELL_PX) {
+					for(double x = std::floor(double(f.box.x0)); x < double(f.box.x1); x += CUTOUT_CELL_PX) {
+						const Premul c = compositeAt2(x + CUTOUT_CELL_PX * 0.5, y + CUTOUT_CELL_PX * 0.5);
+
+						if(!(c.a >= test && c.a > 0)) continue;
+
+						clipper::Paths cell = Clipper2Lib::RectClip(Clipper2Lib::RectD(x, y, x + CUTOUT_CELL_PX, y + CUTOUT_CELL_PX), f.paths, precision);
+
+						if(!cell.empty()) kept.push_back({std::move(cell), solidPaint(c.r / c.a, c.g / c.a, c.b / c.a), nullptr});
+					}
+				}
+
+				continue;
+			}
+
+			// One gradient: below (solids) / gradient / above (solids).
+			const CutPaint& gp = regions[f.stack[size_t(gradientAt)]].paint;
+			Premul below, above;
+
+			for(int k = 0; k < gradientAt; k++) below.over(regions[f.stack[size_t(k)]].paint.color);
+
+			for(size_t k = size_t(gradientAt) + 1; k < f.stack.size(); k++) above.over(regions[f.stack[k]].paint.color);
+
+			auto compositeAt = [&](double t) {
+				Premul c = below;
+
+				c.over(detail::paintColorAtT(gp, t));
+
+				// above over c
+				const double aa = above.a;
+
+				c.r = above.r + c.r * (1 - aa);
+				c.g = above.g + c.g * (1 - aa);
+				c.b = above.b + c.b * (1 - aa);
+				c.a = aa + c.a * (1 - aa);
+
+				return c;
+			};
+
+			// Knots: 0, 1 and every stop (t is clamped to [0, 1]).
+			std::vector<double> knots{0.0, 1.0};
+
+			for(const auto& st : gp.g->stops) knots.push_back(std::clamp(double(st.t), 0.0, 1.0));
+
+			std::sort(knots.begin(), knots.end());
+			knots.erase(std::unique(knots.begin(), knots.end()), knots.end());
+
+			// Kept t-intervals (alpha piecewise linear between knots).
+			std::vector<std::pair<double, double>> keep;
+			std::vector<double> samples(knots);
+
+			auto add = [&](double a, double b) {
+				if(!keep.empty() && std::abs(keep.back().second - a) < 1e-12) keep.back().second = b;
+				else keep.push_back({a, b});
+			};
+
+			for(size_t k = 0; k + 1 < knots.size(); k++) {
+				const double ta = knots[k], tb = knots[k + 1];
+				const double aa = compositeAt(ta).a - test, ab = compositeAt(tb).a - test;
+
+				if(aa >= 0 && ab >= 0) add(ta, tb);
+
+				else if(aa >= 0 || ab >= 0) {
+					const double tc = ta + (tb - ta) * (aa / (aa - ab));
+
+					samples.push_back(tc);
+
+					if(aa >= 0) add(ta, tc);
+					else add(tc, tb);
+				}
+			}
+
+			if(keep.empty()) continue;
+
+			// Clamp semantics: an interval touching 0 / 1 extends to -inf / +inf.
+			for(auto& [a, b] : keep) {
+				if(a <= 0.0) a = -std::numeric_limits<double>::infinity();
+				if(b >= 1.0) b = std::numeric_limits<double>::infinity();
+			}
+
+			// Composite gradient paint: straight color at every knot and crossing.
+			std::sort(samples.begin(), samples.end());
+			samples.erase(std::unique(samples.begin(), samples.end()), samples.end());
+
+			Paint paint;
+
+			paint.type = gp.g->type == GradientInfo::Type::Linear ? Paint::Type::Linear : Paint::Type::Radial;
+			paint.opaque = true;
+			paint.innerRadius = gp.g->innerRadius;
+
+			for(double t : samples) {
+				const Premul c = compositeAt(t);
+
+				paint.stops.push_back({slug_t(t), c.a > 0 ? Color{slug_t(c.r / c.a), slug_t(c.g / c.a), slug_t(c.b / c.a), 1_cv} : Color{0_cv, 0_cv, 0_cv, 1_cv}});
+			}
+
+			if(gp.g->type == GradientInfo::Type::Radial) {
+				const slug_t span = gp.g->transform.xx - gp.g->innerRadius;
+
+				paint.innerRadius = span != 0_cv ? gp.g->innerRadius / span : 0_cv;
+			}
+
+			const auto paintId = static_cast<uint16_t>(mesh.paints.size());
+
+			mesh.paints.push_back(paint);
+
+			// Clip the face to the kept t-set.
+			const double bx0 = double(f.box.x0) - 1, by0 = double(f.box.y0) - 1, bx1 = double(f.box.x1) + 1, by1 = double(f.box.y1) + 1;
+			clipper::Paths keepRegion;
+
+			if(keep.size() == 1 && !std::isfinite(keep[0].first) && !std::isfinite(keep[0].second)) keepRegion = f.paths;
+
+			else if(gp.g->type == GradientInfo::Type::Linear) {
+				const Matrix& L = gp.toLocal;
+				const Matrix& m = gp.g->transform;
+				const double alpha = m.xx * L.xx + m.xy * L.yx;
+				const double beta = m.xx * L.xy + m.xy * L.yy;
+				const double gamma = m.xx * L.dx + m.xy * L.dy + m.dx;
+
+				clipper::Paths slabs;
+
+				for(const auto& [a, b] : keep) {
+					clipper::Path poly = detail::slab(alpha, beta, gamma, a, b, bx0, by0, bx1, by1);
+
+					if(poly.size() >= 3) slabs.push_back(std::move(poly));
+				}
+
+				keepRegion = clipper::intersect(f.paths, slabs);
+			}
+
+			else {
+				// Radial: t + inner' = |Q(px)|, Q affine; level sets are ellipses in px.
+				const Matrix& L = gp.toLocal;
+				const Matrix& m = gp.g->transform;
+				double b00, b01, b10, b11, cx, cy, inner;
+
+				if(gp.g->type == GradientInfo::Type::AffineRadial) {
+					b00 = m.xx; b01 = m.xy; b10 = m.yx; b11 = m.yy; cx = m.dx; cy = m.dy; inner = gp.g->innerRadius;
+				}
+
+				else {
+					const double span = double(m.xx) - gp.g->innerRadius;
+					const double k = span != 0 ? 1.0 / span : 0.0;
+
+					b00 = k; b01 = 0; b10 = 0; b11 = k; cx = m.dx; cy = m.dy; inner = gp.g->innerRadius * k;
+				}
+
+				// Q(px) = B (L px + Lt - c)
+				const double q00 = b00 * L.xx + b01 * L.yx, q01 = b00 * L.xy + b01 * L.yy;
+				const double q10 = b10 * L.xx + b11 * L.yx, q11 = b10 * L.xy + b11 * L.yy;
+				const double qx = b00 * (L.dx - cx) + b01 * (L.dy - cy);
+				const double qy = b10 * (L.dx - cx) + b11 * (L.dy - cy);
+				const double det = q00 * q11 - q01 * q10;
+
+				if(std::abs(det) < 1e-18) continue;
+
+				auto ellipse = [&](double r) {
+					clipper::Path poly;
+
+					// px radius of the ellipse's longest axis decides the segment count.
+					const double rpx = r * std::sqrt((q00 * q00 + q01 * q01 + q10 * q10 + q11 * q11) / (det * det));
+					const double tol = std::max(1e-3, double(cfg.tolerancePx));
+					const int n = std::clamp(int(std::ceil(PI_CV / std::acos(std::max(-1.0, 1.0 - tol / std::max(rpx, tol))))), 16, 2048);
+
+					for(int k = 0; k < n; k++) {
+						const double a = 2.0 * PI_CV * k / n;
+						const double ux = r * std::cos(a) - qx, uy = r * std::sin(a) - qy;
+
+						poly.push_back({(q11 * ux - q01 * uy) / det, (-q10 * ux + q00 * uy) / det});
+					}
+
+					return poly;
+				};
+
+				const clipper::Path boxPoly{{bx0, by0}, {bx1, by0}, {bx1, by1}, {bx0, by1}};
+				clipper::Paths annuli;
+
+				for(const auto& [a, b] : keep) {
+					const double r0 = std::isfinite(a) ? a + inner : -1.0;
+					const double r1 = std::isfinite(b) ? b + inner : std::numeric_limits<double>::infinity();
+
+					if(r1 <= 0) continue;
+
+					clipper::Paths outer = std::isfinite(r1) ? clipper::Paths{ellipse(r1)} : clipper::Paths{boxPoly};
+
+					if(r0 > 0) outer = clipper::difference(clipper::normalize(outer, FillRule::NonZero), clipper::normalize({ellipse(r0)}, FillRule::NonZero));
+					else outer = clipper::normalize(outer, FillRule::NonZero);
+
+					annuli = clipper::unite(annuli, outer);
+				}
+
+				keepRegion = clipper::intersect(f.paths, annuli);
+			}
+
+			if(!keepRegion.empty()) kept.push_back({std::move(keepRegion), paintId, &gp});
+		}
+	}
+
+	// Emit (everything opaque, no overlay).
+	for(const Kept& k : kept) {
+		const tessellate::Mesh2D tri = detail::triangulateTiled(k.paths);
+		const auto base = static_cast<uint32_t>(mesh.positions.size() / 2);
+
+		for(size_t v = 0; v + 1 < tri.positions.size(); v += 2) {
+			const double x = tri.positions[v], y = tri.positions[v + 1];
+
+			mesh.positions.push_back(static_cast<float>(x / cfg.width));
+			mesh.positions.push_back(static_cast<float>(cfg.vUp ? 1.0 - y / cfg.height : y / cfg.height));
+			mesh.paintIds.push_back(k.paint);
+
+			slug_t p0 = 0_cv, p1 = 0_cv;
+
+			if(k.gradient) {
+				slug_t lx, ly;
+
+				k.gradient->toLocal.apply(slug_t(x), slug_t(y), lx, ly);
+
+				const Matrix& m = k.gradient->g->transform;
+
+				switch(k.gradient->g->type) {
+					case GradientInfo::Type::Linear:
+						p0 = m.xx * lx + m.xy * ly + m.dx;
+						break;
+
+					case GradientInfo::Type::AffineRadial:
+						p0 = m.xx * (lx - m.dx) + m.xy * (ly - m.dy);
+						p1 = m.yx * (lx - m.dx) + m.yy * (ly - m.dy);
+						break;
+
+					case GradientInfo::Type::Radial: {
+						const slug_t span = m.xx - k.gradient->g->innerRadius;
+						const slug_t kk = span != 0_cv ? 1_cv / span : 0_cv;
+
+						p0 = (lx - m.dx) * kk;
+						p1 = (ly - m.dy) * kk;
+						break;
+					}
+
+					default:
+						break;
+				}
+			}
+
+			mesh.params.push_back(static_cast<float>(p0));
+			mesh.params.push_back(static_cast<float>(p1));
+		}
+
+		for(size_t t = 0; t + 2 < tri.indices.size(); t += 3) {
+			uint32_t a = base + tri.indices[t], b = base + tri.indices[t + 1], c = base + tri.indices[t + 2];
+
+			const float* P = mesh.positions.data();
+			const double area2 =
+				(double(P[b * 2]) - P[a * 2]) * (double(P[c * 2 + 1]) - P[a * 2 + 1]) -
+				(double(P[c * 2]) - P[a * 2]) * (double(P[b * 2 + 1]) - P[a * 2 + 1])
+			;
+
+			if(area2 == 0.0) continue;
+			if(area2 < 0.0) std::swap(b, c);
+
+			mesh.indices.push_back(a);
+			mesh.indices.push_back(b);
+			mesh.indices.push_back(c);
+		}
+	}
+
+	mesh.opaqueIndexCount = static_cast<uint32_t>(mesh.indices.size());
+	mesh.overlayIndexCount = 0;
+	mesh.trianglesAfter = mesh.indices.size() / 3;
+
+	return mesh;
+}
+
+
 // Bakes @p composite (shapes in @p atlas) into one planar mesh. See BakedMesh for the layout.
 // Sweep gradients are emitted as Radial paints with the raw (x, y) offset from the center (the
 // consumer would need atan2); slughorn's SVG loaders never produce them.
@@ -560,8 +1202,11 @@ inline BakedMesh bakeMesh(
 	const Atlas& atlas,
 	const CompositeShape& composite,
 	const std::vector<LayerSource>& meta,
-	const BakeConfig& cfg
+	const BakeConfig& cfg,
+	const stamp::Set* stamps=nullptr
 ) {
+	if(cfg.alphaTest > 0_cv) return bakeCutout(atlas, composite, meta, cfg, stamps);
+
 	BakedMesh mesh;
 
 	mesh.tolerancePx = cfg.tolerancePx;
@@ -572,6 +1217,9 @@ inline BakedMesh bakeMesh(
 		size_t layer;
 		clipper::Paths paths;
 		bool opaque;
+		bool stamp = false; // one expanded stamp instance
+		Color color = {};
+		const stamp::Instance* inst = nullptr;
 	};
 
 	std::vector<Region> regions;
@@ -581,6 +1229,36 @@ inline BakedMesh bakeMesh(
 		const Layer& layer = composite.layers[li];
 
 		if(layer.drawMode != DrawMode::Visible) continue;
+
+		// Stamp layers expand to one region per instance, in paint order.
+		if(stamp::isStampLayer(layer)) {
+			if(!stamps || stamp::stampIndex(layer) >= stamps->layers.size()) continue;
+
+			const Matrix toPx = Matrix::scale(ppe, ppe);
+
+			for(const stamp::Instance& in : stamps->layers[stamp::stampIndex(layer)].instances) {
+				if(in.color.a <= 0_cv) continue;
+
+				auto paths = clipper::normalize(
+					clipper::toPaths(stamp::instanceContours(*stamps, in), cfg.tolerancePx, toPx),
+					FillRule::NonZero
+				);
+
+				if(paths.empty()) continue;
+
+				mesh.trianglesBefore += detail::triangulateTiled(paths).indices.size() / 3;
+
+				bool opaque = in.color.a >= cfg.opaqueAlpha;
+
+				if(in.gradient && in.gradient <= stamps->gradients.size()) {
+					for(const auto& st : stamps->gradients[in.gradient - 1].stops) if(st.color.a * in.color.a < cfg.opaqueAlpha) opaque = false;
+				}
+
+				regions.push_back({li, std::move(paths), opaque, true, in.color, &in});
+			}
+
+			continue;
+		}
 
 		const auto shape = atlas.getShape(layer.key);
 
@@ -698,6 +1376,27 @@ inline BakedMesh bakeMesh(
 
 	std::vector<uint32_t> overlay;
 
+	// Solid paints are shared: every region of the same color and opacity class gets one id.
+	std::map<std::array<int64_t, 5>, uint16_t> solidIds;
+
+	auto solidPaint = [&](const Paint& p) -> uint16_t {
+		const std::array<int64_t, 5> k{
+			std::llround(double(p.color.r) * 65536), std::llround(double(p.color.g) * 65536),
+			std::llround(double(p.color.b) * 65536), std::llround(double(p.color.a) * 65536), p.opaque ? 1 : 0
+		};
+
+		auto it = solidIds.find(k);
+
+		if(it != solidIds.end()) return it->second;
+
+		const auto id = static_cast<uint16_t>(mesh.paints.size());
+
+		mesh.paints.push_back(p);
+		solidIds[k] = id;
+
+		return id;
+	};
+
 	for(size_t ri = 0; ri < regions.size(); ri++) {
 		const Region& r = regions[ri];
 
@@ -719,22 +1418,75 @@ inline BakedMesh bakeMesh(
 
 		const Layer& layer = composite.layers[r.layer];
 		const LayerSource src = r.layer < meta.size() ? meta[r.layer] : LayerSource{};
-		const auto shape = atlas.getShape(layer.key);
+		const auto shape = r.stamp ? std::optional<Atlas::Shape>{} : atlas.getShape(layer.key);
 
-		const auto paintId = static_cast<uint16_t>(mesh.paints.size());
-
-		mesh.paints.push_back(detail::paintOf(atlas, layer, src, cfg.opaqueAlpha));
-
-		const GradientInfo* grad = (layer.gradientId > 0 && layer.gradientId <= gradients.size())
+		const GradientInfo* grad = (!r.stamp && layer.gradientId > 0 && layer.gradientId <= gradients.size())
 			? &gradients[layer.gradientId - 1]
 			: nullptr
 		;
 
+		// Stamp instance with a prototype-frame gradient: params come from the unit frame.
+		stamp::Inverse stampInv;
+
+		if(r.stamp && r.inst && r.inst->gradient && stamps && r.inst->gradient <= stamps->gradients.size()) {
+			grad = &stamps->gradients[r.inst->gradient - 1];
+			stampInv = stamp::invert(r.inst->m);
+		}
+
+		uint16_t paintId = 0;
+
+		if(r.stamp && grad) {
+			// One paint per (gradient, tint).
+			const std::array<int64_t, 5> k{
+				-int64_t(r.inst->gradient), std::llround(double(r.color.r) * 65536), std::llround(double(r.color.g) * 65536),
+				std::llround(double(r.color.b) * 65536), std::llround(double(r.color.a) * 65536)
+			};
+
+			auto it = solidIds.find(k);
+
+			if(it != solidIds.end()) paintId = it->second;
+
+			else {
+				Paint p;
+
+				p.type = grad->type == GradientInfo::Type::Linear ? Paint::Type::Linear : Paint::Type::Radial;
+				p.stops = grad->stops;
+				p.innerRadius = grad->innerRadius;
+				p.opaque = r.opaque;
+
+				for(auto& st : p.stops) {
+					st.color.r *= r.color.r;
+					st.color.g *= r.color.g;
+					st.color.b *= r.color.b;
+					st.color.a *= r.color.a;
+				}
+
+				paintId = static_cast<uint16_t>(mesh.paints.size());
+				mesh.paints.push_back(p);
+				solidIds[k] = paintId;
+			}
+		}
+
+		else if(r.stamp) {
+			Paint p;
+
+			p.color = r.color;
+			p.opaque = r.opaque;
+			paintId = solidPaint(p);
+		}
+
+		else if(!grad) paintId = solidPaint(detail::paintOf(atlas, layer, src, cfg.opaqueAlpha));
+
+		else {
+			paintId = static_cast<uint16_t>(mesh.paints.size());
+			mesh.paints.push_back(detail::paintOf(atlas, layer, src, cfg.opaqueAlpha));
+		}
+
 		const auto base = static_cast<uint32_t>(mesh.positions.size() / 2);
 
 		const slug_t s = layer.scale;
-		const slug_t ox = (layer.transform.x - shape->originX) * s;
-		const slug_t oy = (layer.transform.y - shape->originY) * s;
+		const slug_t ox = shape ? (layer.transform.x - shape->originX) * s : 0_cv;
+		const slug_t oy = shape ? (layer.transform.y - shape->originY) * s : 0_cv;
 
 		for(size_t v = 0; v + 1 < tri.positions.size(); v += 2) {
 			const slug_t x = tri.positions[v], y = tri.positions[v + 1];
@@ -746,9 +1498,18 @@ inline BakedMesh bakeMesh(
 			slug_t p0 = 0_cv, p1 = 0_cv;
 
 			if(grad) {
-				// Back to the layer's local em-space, where GradientInfo lives.
-				const slug_t lx = (x / ppe - ox) / s;
-				const slug_t ly = (y / ppe - oy) / s;
+				// Back to the space GradientInfo lives in: the layer's local em-space, or a stamp
+				// instance's prototype unit frame.
+				slug_t lx = (x / ppe - ox) / s;
+				slug_t ly = (y / ppe - oy) / s;
+
+				if(r.stamp) {
+					const slug_t ex = x / ppe, ey = y / ppe;
+
+					lx = stampInv.a * ex + stampInv.b * ey + stampInv.e;
+					ly = stampInv.c * ex + stampInv.d * ey + stampInv.f;
+				}
+
 				const Matrix& m = grad->transform;
 
 				switch(grad->type) {
@@ -790,7 +1551,7 @@ inline BakedMesh bakeMesh(
 		if(grad && grad->type == GradientInfo::Type::Radial) {
 			const slug_t span = grad->transform.xx - grad->innerRadius;
 
-			mesh.paints.back().innerRadius = span != 0_cv ? grad->innerRadius / span : 0_cv;
+			mesh.paints[paintId].innerRadius = span != 0_cv ? grad->innerRadius / span : 0_cv;
 		}
 
 		auto& dstIdx = (r.opaque && cfg.planarize) ? mesh.indices : overlay;
@@ -849,7 +1610,16 @@ struct Cost {
 	size_t trianglesBefore = 0;
 	size_t trianglesAfter = 0;
 
-	// "mesh" | "slug" | "mean"
+	// Stamp layers (stamp.hpp): how many, their instances, and the per-pixel work of the worst
+	// cell: sum over stamp layers of maxPerCell x (prototype curves per band (h + v), or 1 for the
+	// analytic rect / ellipse). stampGrid is the largest G picked (buildGrid).
+	size_t stampLayers = 0;
+	size_t stampInstances = 0;
+	uint32_t stampMaxPerCell = 0;
+	uint32_t stampGrid = 0;
+	double stampWork = 0.0;
+
+	// "mesh" | "stamp" | "slug" | "mean"
 	std::string mode;
 };
 
@@ -859,6 +1629,8 @@ struct Cost {
 //    exact at any distance up to the bake tolerance, no per-fragment curve work at all.
 // 2. "slug" when the mesh would be big but the Slug shader's expected per-fragment work (mean
 //    curve evaluations, quad overdraw included) and its quad count stay modest.
+// 2b. "stamp" for keys with stamp layers whose Slug work plus stamp work (worst cell) stays
+//    under the same per-fragment budget: Slug for the ordinary layers + the stamp shader.
 // 3. "mesh" again up to a hard triangle budget: heavy, but still cheaper than heavy Slug.
 // 4. "mean": too heavy either way - draw the key's mean color (or a low-res raster) instead.
 inline constexpr size_t MESH_TRIANGLES_MAX = 4096;
@@ -868,7 +1640,12 @@ inline constexpr size_t MESH_TRIANGLES_HARD_MAX = 65536;
 
 inline std::string recommend(const Cost& c) {
 	if(c.trianglesAfter <= MESH_TRIANGLES_MAX) return "mesh";
-	if(c.slugWorkMean <= SLUG_WORK_MEAN_MAX && c.layersAfter <= SLUG_LAYERS_MAX) return "slug";
+
+	if(c.stampLayers > 0) {
+		if(c.slugWorkMean + c.stampWork <= SLUG_WORK_MEAN_MAX && c.layersAfter <= SLUG_LAYERS_MAX) return "stamp";
+	}
+
+	else if(c.slugWorkMean <= SLUG_WORK_MEAN_MAX && c.layersAfter <= SLUG_LAYERS_MAX) return "slug";
 	if(c.trianglesAfter <= MESH_TRIANGLES_HARD_MAX) return "mesh";
 
 	return "mean";
@@ -882,7 +1659,9 @@ inline Cost cost(
 	const BakedMesh& mesh,
 	size_t layersBefore,
 	slug_t canvasEmW=0_cv,
-	slug_t canvasEmH=0_cv
+	slug_t canvasEmH=0_cv,
+	const stamp::Set* stamps=nullptr,
+	slug_t pxPerEm=0_cv
 ) {
 	if(canvasEmW <= 0_cv || canvasEmH <= 0_cv) {
 		const auto bb = composite.boundingBox(atlas);
@@ -901,7 +1680,33 @@ inline Cost cost(
 	c.trianglesBefore = mesh.trianglesBefore;
 	c.trianglesAfter = mesh.trianglesAfter;
 
+	static const stamp::Set noStamps{};
+
+	stamp::Evaluator ev(atlas, stamps ? *stamps : noStamps);
+
+	if(stamps) for(const auto& p : stamps->protos) c.curves += p.curves.size();
+
 	for(const auto& layer : composite.layers) {
+		if(stamp::isStampLayer(layer)) {
+			if(!stamps || stamp::stampIndex(layer) >= stamps->layers.size()) continue;
+
+			const stamp::Layer& sl = stamps->layers[stamp::stampIndex(layer)];
+			const auto grid = stamp::buildGrid(atlas, *stamps, sl, canvasEmW, canvasEmH,
+				pxPerEm > 0_cv ? pxPerEm : 1_cv / canvasEmW);
+
+			uint32_t factor = 1;
+
+			for(const auto& in : sl.instances) factor = std::max(factor, ev.bandCost(in.proto));
+
+			c.stampLayers++;
+			c.stampInstances += sl.instances.size();
+			c.stampMaxPerCell = std::max(c.stampMaxPerCell, grid.maxPerCell);
+			c.stampGrid = std::max(c.stampGrid, grid.G);
+			c.stampWork += double(grid.maxPerCell) * double(factor);
+
+			continue;
+		}
+
 		if(layer.gradientId) c.gradientLayers++;
 
 		const auto shape = atlas.getShape(layer.key);
