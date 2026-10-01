@@ -499,7 +499,8 @@ struct BakedMesh {
 	// v = 1 - y / height (v = 0 at the bottom). Every triangle is wound counter-clockwise in the
 	// emitted (u, v) plane (positive signed area with u right, v up-the-axis).
 	std::vector<float> positions;   // 2 per vertex (u, v)
-	std::vector<uint16_t> paintIds; // 1 per vertex, index into paints
+	std::vector<uint32_t> paintIds; // 1 per vertex, index into paints (32-bit: a key with many
+	                                // gradients can need more than 65536 composite ramps)
 	std::vector<float> params;      // 2 per vertex: linear (t, 0); radial (gx, gy); solid (0, 0)
 
 	// Triangle list: [0, opaqueIndexCount) is the planar opaque set (order irrelevant, no
@@ -1181,12 +1182,12 @@ inline BakedMesh bakeFinal(
 	auto keeps = [&](double a) { return mode == AlphaMode::Opaque || (a >= test && a > 0); };
 	auto paintAlpha = [&](double a) { return mode == AlphaMode::Transparent ? std::clamp(a, 0.0, 1.0) : 1.0; };
 
-	std::map<std::array<int64_t, 4>, uint16_t> solidIds;
-	std::map<std::vector<int64_t>, uint16_t> rampIds;
+	std::map<std::array<int64_t, 4>, uint32_t> solidIds;
+	std::map<std::vector<int64_t>, uint32_t> rampIds;
 
 	struct Kept {
 		clipper::Paths paths;
-		uint16_t paint;
+		uint32_t paint;
 		const CutPaint* gradient; // for the per-vertex parameter
 	};
 
@@ -1204,7 +1205,7 @@ inline BakedMesh bakeFinal(
 		p.color = {slug_t(f.r), slug_t(f.g), slug_t(f.b), slug_t(pa)};
 		p.opaque = pa >= FINAL_OPAQUE_ALPHA;
 
-		const auto id = static_cast<uint16_t>(mesh.paints.size());
+		const auto id = static_cast<uint32_t>(mesh.paints.size());
 
 		mesh.paints.push_back(p);
 		solidIds[k] = id;
@@ -1415,12 +1416,12 @@ inline BakedMesh bakeFinal(
 				for(double v : {double(st.t), double(st.color.r), double(st.color.g), double(st.color.b), double(st.color.a)}) sig.push_back(std::llround(v * 65536));
 			}
 
-			uint16_t paintId;
+			uint32_t paintId;
 
 			if(auto it = rampIds.find(sig); it != rampIds.end()) paintId = it->second;
 
 			else {
-				paintId = static_cast<uint16_t>(mesh.paints.size());
+				paintId = static_cast<uint32_t>(mesh.paints.size());
 				mesh.paints.push_back(paint);
 				rampIds.emplace(std::move(sig), paintId);
 			}
@@ -1748,7 +1749,7 @@ inline double simplifyBaked(BakedMesh& m, double widthPx, double heightPx, size_
 			keep[i] = unsigned(r.positions.size() / 2);
 			r.positions.push_back(uv[i].u);
 			r.positions.push_back(uv[i].v);
-			r.paintIds.push_back(uint16_t(uv[i].paint));
+			r.paintIds.push_back(uint32_t(uv[i].paint));
 			r.params.push_back(uv[i].p0);
 			r.params.push_back(uv[i].p1);
 		}
@@ -1911,9 +1912,9 @@ inline BakedMesh bakeMesh(
 	std::vector<uint32_t> overlay;
 
 	// Solid paints are shared: every region of the same color and opacity class gets one id.
-	std::map<std::array<int64_t, 5>, uint16_t> solidIds;
+	std::map<std::array<int64_t, 5>, uint32_t> solidIds;
 
-	auto solidPaint = [&](const Paint& p) -> uint16_t {
+	auto solidPaint = [&](const Paint& p) -> uint32_t {
 		const std::array<int64_t, 5> k{
 			std::llround(double(p.color.r) * 65536), std::llround(double(p.color.g) * 65536),
 			std::llround(double(p.color.b) * 65536), std::llround(double(p.color.a) * 65536), p.opaque ? 1 : 0
@@ -1923,7 +1924,7 @@ inline BakedMesh bakeMesh(
 
 		if(it != solidIds.end()) return it->second;
 
-		const auto id = static_cast<uint16_t>(mesh.paints.size());
+		const auto id = static_cast<uint32_t>(mesh.paints.size());
 
 		mesh.paints.push_back(p);
 		solidIds[k] = id;
@@ -1934,7 +1935,7 @@ inline BakedMesh bakeMesh(
 	// Per region (lazily): its paint id and how a vertex maps into its gradient's space.
 	struct RegionPaint {
 		bool ready = false;
-		uint16_t id = 0;
+		uint32_t id = 0;
 		const GradientInfo* grad = nullptr;
 		bool stampFrame = false;
 		stamp::Inverse inv;
@@ -1993,7 +1994,7 @@ inline BakedMesh bakeMesh(
 					st.color.a *= r.color.a;
 				}
 
-				rp.id = static_cast<uint16_t>(mesh.paints.size());
+				rp.id = static_cast<uint32_t>(mesh.paints.size());
 				mesh.paints.push_back(p);
 				solidIds[k] = rp.id;
 			}
@@ -2010,7 +2011,7 @@ inline BakedMesh bakeMesh(
 		else if(!rp.grad) rp.id = solidPaint(detail::paintOf(atlas, layer, src, cfg.opaqueAlpha));
 
 		else {
-			rp.id = static_cast<uint16_t>(mesh.paints.size());
+			rp.id = static_cast<uint32_t>(mesh.paints.size());
 			mesh.paints.push_back(detail::paintOf(atlas, layer, src, cfg.opaqueAlpha));
 		}
 

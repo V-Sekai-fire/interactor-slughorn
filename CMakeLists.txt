@@ -138,7 +138,7 @@ if(SLUGHORN_NANOSVG)
 	)
 endif()
 
-# https://github.com/AngusJohnson/Clipper2 (vendored as ext/clipper2, pinned Clipper2_1.5.4).
+# Clipper2 (vendored as ext/clipper2, pinned Clipper2_1.5.4).
 # Compiled as its own static library so slughorn's strict warning flags don't apply to it.
 if(SLUGHORN_CLIPPER2)
 	if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ext/clipper2/CPP/Clipper2Lib")
@@ -168,7 +168,7 @@ if(SLUGHORN_CLIPPER2)
 	target_link_libraries(slughorn PUBLIC slughorn_clipper2)
 endif()
 
-# https://github.com/zeux/meshoptimizer - the bake's LOD simplification (bake.hpp simplifyBaked). Not
+# meshoptimizer - the bake's LOD simplification (bake.hpp simplifyBaked). Not
 # vendored: point SLUGHORN_MESHOPTIMIZER_DIR at a checkout (the workspace keeps one at
 # 2-contract/meshoptimizer), or clone it to ext/meshoptimizer. Only the simplifier and the index
 # generator are compiled.
@@ -195,7 +195,7 @@ if(SLUGHORN_MESHOPT)
 	target_link_libraries(slughorn PUBLIC slughorn_meshopt)
 endif()
 
-# https://github.com/thorvg/thorvg (vendored as ext/thorvg, pinned v1.0.3 - the version Godot's
+# ThorVG (vendored as ext/thorvg, pinned v1.0.3 - the version Godot's
 # thirdparty/thorvg ships). ThorVG's own build is meson; like Godot (modules/svg/SCsub) we compile
 # the subset we need directly: common + renderer + sw_engine + the SVG and raw loaders. No PNG/JPG/
 # WebP loaders (embedded raster <image>s are skipped by slughorn/thorvg.hpp anyway), no Lottie,
@@ -211,8 +211,8 @@ if(SLUGHORN_THORVG)
 
 	set(_slughorn_tvg "${CMAKE_CURRENT_SOURCE_DIR}/ext/thorvg")
 
-	# Godot's own ThorVG patch (thirdparty/thorvg/patches/0001-let-delete-be-delete.patch,
-	# GH-116024): ThorVG 1.0.x replaces the GLOBAL operator new/delete with tvg::malloc/free,
+	# Godot's own ThorVG patch (thirdparty/thorvg/patches/0001-let-delete-be-delete.patch):
+	# ThorVG 1.0.x replaces the GLOBAL operator new/delete with tvg::malloc/free,
 	# which collides with any host that defines them too (godot-sandbox's guest runtime does) and
 	# silently reroutes every allocation of the embedding program otherwise. Applied the same
 	# idempotent way as the NanoSVG patches above.

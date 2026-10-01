@@ -532,6 +532,20 @@ static bool identical(const std::vector<slug_t>& a, const std::vector<slug_t>& b
 	return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
 }
 
+static void writePngImg(const std::string& path, const std::vector<slug_t>& img, uint32_t W, uint32_t H, double gain=1.0, bool diff=false) {
+	std::vector<uint8_t> rgb(size_t(W) * H * 3);
+
+	for(size_t p = 0; p < size_t(W) * H; p++) {
+		for(int k = 0; k < 3; k++) {
+			const double v = diff ? double(img[p * 4 + size_t(k)]) * gain : double(img[p * 4 + size_t(k)]) + (1.0 - double(img[p * 4 + 3]));
+
+			rgb[p * 3 + size_t(k)] = uint8_t(std::lround(std::clamp(v, 0.0, 1.0) * 255));
+		}
+	}
+
+	stbi_write_png(path.c_str(), int(W), int(H), 3, rgb.data(), int(W * 3));
+}
+
 // One measured case (a key, or a content-class sample).
 struct Decomposition {
 	std::string name;
@@ -623,6 +637,74 @@ static Decomposition decompose(const std::string& name, const std::string& svg, 
 		runKey(svg, before, W, v);
 
 		const auto meshBefore = rasterizeMesh(bakeShown(before, dc.card), W, H, true, spp);
+
+		if(const char* dump = std::getenv("SLUG_DUMP_BAKE"); dump && name == dump) {
+			const std::string base = std::string(std::getenv("SLUG_DUMP_DIR") ? std::getenv("SLUG_DUMP_DIR") : ".") + "/" + name;
+
+			writePngImg(base + "-direct-ref.png", directForBake, W, H);
+			writePngImg(base + "-bake-before.png", meshBefore, W, H);
+			writePngImg(base + "-bake-after.png", meshAfter, W, H);
+			writePngImg(base + "-diff-before.png", sheet::absDiff(directForBake, meshBefore), W, H, 4.0, true);
+			writePngImg(base + "-diff-after.png", sheet::absDiff(directForBake, meshAfter), W, H, 4.0, true);
+
+			// The instances at a probe point (canvas em), both modes.
+			if(const char* pt = std::getenv("SLUG_DUMP_POINT")) {
+				double ex = 0, ey = 0;
+
+				std::sscanf(pt, "%lf,%lf", &ex, &ey);
+
+				// The baked triangle under the point, both modes.
+				for(int which = 0; which < 2; which++) {
+					const auto mesh = bakeShown(which ? after : before, dc.card);
+					const double u = ex, v = 1.0 - ey / double(after.sc.cfg.heightEm);
+
+					for(size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+						const uint32_t a = mesh.indices[t], b = mesh.indices[t + 1], c = mesh.indices[t + 2];
+						auto P = [&](uint32_t i) { return std::pair<double, double>{mesh.positions[i * 2], mesh.positions[i * 2 + 1]}; };
+						const auto [ax, ay] = P(a);
+						const auto [bx, by] = P(b);
+						const auto [cx, cy] = P(c);
+						const double d = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+						const double w1 = ((u - ax) * (cy - ay) - (cx - ax) * (v - ay)) / d, w2 = ((bx - ax) * (v - ay) - (u - ax) * (by - ay)) / d;
+
+						if(w1 < 0 || w2 < 0 || w1 + w2 > 1) continue;
+
+						const auto& pp = mesh.paints[mesh.paintIds[a]];
+
+						std::cout << (which ? "  AFTER" : "  BEFORE") << " triangle paint " << mesh.paintIds[a] << " type " << int(pp.type) << " color (" << pp.color.r << "," << pp.color.g << "," << pp.color.b << ")";
+
+						for(const auto& st : pp.stops) std::cout << " [" << st.t << ": " << st.color.r << "," << st.color.g << "," << st.color.b << "," << st.color.a << "]";
+
+						std::cout << " param (" << mesh.params[a * 2] << "," << mesh.params[a * 2 + 1] << ")" << std::endl;
+					}
+				}
+
+				for(KeyRun* kr : {&before, &after}) {
+					std::cout << (kr == &before ? "  BEFORE" : "  AFTER") << " gradients " << kr->sc.set.gradients.size() << std::endl;
+
+					for(size_t li = 0; li < kr->sc.set.layers.size(); li++) {
+						for(const auto& in : kr->sc.set.layers[li].instances) {
+							const auto b = slughorn::stamp::bounds(in, kr->sc.set);
+
+							if(ex < b.x0 || ex > b.x1 || ey < b.y0 || ey > b.y1) continue;
+
+							const auto& pr = kr->sc.set.protos[in.proto];
+
+							std::cout << "    layer " << li << " proto " << in.proto << " kind " << int(pr.kind) << " grad " << in.gradient << " color ("
+								<< in.color.r << "," << in.color.g << "," << in.color.b << "," << in.color.a << ")";
+
+							if(in.gradient && in.gradient <= kr->sc.set.gradients.size()) {
+								const auto& g = kr->sc.set.gradients[in.gradient - 1];
+
+								std::cout << " gtype " << int(g.type) << " stop0 (" << g.stops.front().color.r << "," << g.stops.front().color.g << "," << g.stops.front().color.b << ")";
+							}
+
+							std::cout << std::endl;
+						}
+					}
+				}
+			}
+		}
 
 		dc.protoCurvesBefore = before.protoCurves;
 		dc.errDecodeBefore = compare(before.decode, direct.img);

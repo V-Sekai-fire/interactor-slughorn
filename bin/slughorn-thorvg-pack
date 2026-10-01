@@ -58,7 +58,7 @@ FORMAT_DOC = {
 	"uv": "u = x_px / width, v = 1 - y_px / height (v up, three.js/OpenGL convention)",
 	"winding": "every baked triangle is counter-clockwise in (u, v)",
 	"POSITION": "float32 VEC2 (u, v)",
-	"PAINT": "uint16 SCALAR, index into the key's paints[]",
+	"PAINT": "uint32 SCALAR, index into the key's paints[]",
 	"PARAM": "float32 VEC2: linear (t, 0); radial (gx, gy) with t = length(gx, gy) - inner_radius; solid (0, 0)",
 	"indices": "uint32 SCALAR triangle list; [0, opaque_index_count) planar opaque set (no overlaps, any "
 		"order), then overlay_index_count indices drawn after it in order with alpha blending",
@@ -204,7 +204,7 @@ def main():
 			us, vs = memoryview(mesh.positions).cast("B").cast("f")[0::2], memoryview(mesh.positions).cast("B").cast("f")[1::2]
 			mesh_entry["attributes"] = {
 				"POSITION": bin_.add(pos, GL_FLOAT, nverts, "VEC2", {"min": [min(us), min(vs)], "max": [max(us), max(vs)]}),
-				"PAINT": bin_.add(pid, GL_UNSIGNED_SHORT, nverts, "SCALAR"),
+				"PAINT": bin_.add(pid, GL_UNSIGNED_INT, nverts, "SCALAR"),
 				"PARAM": bin_.add(par, GL_FLOAT, nverts, "VEC2"),
 			}
 			mesh_entry["indices"] = bin_.add(idx, GL_UNSIGNED_INT, len(idx) // 4, "SCALAR")

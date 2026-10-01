@@ -3,7 +3,7 @@
 // ================================================================================================
 // ThorVG backend for slughorn
 //
-// Loads SVG files/strings with ThorVG (https://github.com/thorvg/thorvg, the vector library Godot
+// Loads SVG files/strings with ThorVG (the vector library Godot
 // embeds) and converts its paint tree into slughorn Atlas shapes, producing a CompositeShape with
 // one Layer per painted ThorVG Shape (fill first, then stroke), back-to-front order preserved.
 //

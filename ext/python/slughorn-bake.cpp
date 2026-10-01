@@ -67,7 +67,7 @@ void bind_bake(py::module_& bake) {
 		}, "Zero-copy (N, 2) float32 view: UV in [0,1], v = 0 at the top edge (SVG Y-down).")
 		.def_property_readonly("paint_ids", [](const BakedMesh& m) {
 			return flatView2D(m.paintIds, 1);
-		}, "Zero-copy (N, 1) uint16 view: per-vertex paint index.")
+		}, "Zero-copy (N, 1) uint32 view: per-vertex paint index.")
 		.def_property_readonly("params", [](const BakedMesh& m) {
 			return flatView2D(m.params, 2);
 		}, "Zero-copy (N, 2) float32 view: linear (t, 0), radial (gx, gy), solid (0, 0).")
