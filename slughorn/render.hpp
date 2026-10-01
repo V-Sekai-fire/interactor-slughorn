@@ -23,6 +23,7 @@
 
 #include "slughorn.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -569,6 +570,213 @@ inline Sampler decode(
 	for(auto& idx : out.vbandIndices) idx = remap.at(idx);
 
 	return out;
+}
+
+// ================================================================================================
+// Composite rendering - CPU reference for a whole CompositeShape
+//
+// renderComposite() evaluates every visible layer of @p composite with the band-accelerated
+// coverage path (the GPU shader's), shades it with the layer color or its gradient (Linear,
+// Radial, AffineRadial, Sweep - same t formulas the shader uses, pad spread), and src-over
+// composites the layers back-to-front into a premultiplied RGBA float image.
+//
+// The image samples the em-space window [emX0, emX0 + emWidth) x [emY0, emY0 + emHeight); pixel
+// (row j, col i) is the sample at em (emX0 + (i + 0.5) / width * emWidth, emY0 + (j + 0.5) /
+// height * emHeight), i.e. row 0 is the window's LOW em-y edge. For SVG-loaded content (whose
+// em-space is Y-down) that is the top of the picture, matching image orientation.
+//
+// Intended for validation (backend parity tests, golden images), not speed.
+// ================================================================================================
+
+struct Image {
+	uint32_t width = 0;
+	uint32_t height = 0;
+
+	// Row-major premultiplied RGBA: data[(row * width + col) * 4 + c].
+	std::vector<slug_t> data = {};
+};
+
+inline slug_t gradientT(const GradientInfo& g, slug_t x, slug_t y) {
+	const Matrix& m = g.transform;
+
+	switch(g.type) {
+		case GradientInfo::Type::Linear:
+			return m.xx * x + m.xy * y + m.dx;
+
+		case GradientInfo::Type::Radial: {
+			const slug_t span = m.xx - g.innerRadius;
+			const slug_t d = std::sqrt((x - m.dx) * (x - m.dx) + (y - m.dy) * (y - m.dy));
+
+			return span != 0_cv ? (d - g.innerRadius) / span : 0_cv;
+		}
+
+		case GradientInfo::Type::AffineRadial: {
+			const slug_t dx = x - m.dx, dy = y - m.dy;
+			const slug_t gx = m.xx * dx + m.xy * dy;
+			const slug_t gy = m.yx * dx + m.yy * dy;
+
+			return std::sqrt(gx * gx + gy * gy) - g.innerRadius;
+		}
+
+		case GradientInfo::Type::Sweep: {
+			const slug_t a = std::atan2(y - m.dy, x - m.dx);
+
+			return m.xy != 0_cv ? (a - m.xx) / m.xy : 0_cv;
+		}
+	}
+
+	return 0_cv;
+}
+
+inline Color gradientColor(const GradientInfo& g, slug_t t) {
+	if(g.stops.empty()) return {};
+
+	t = std::clamp(t, 0_cv, 1_cv);
+
+	if(t <= g.stops.front().t) return g.stops.front().color;
+	if(t >= g.stops.back().t) return g.stops.back().color;
+
+	for(size_t i = 1; i < g.stops.size(); i++) {
+		const auto& a = g.stops[i - 1];
+		const auto& b = g.stops[i];
+
+		if(t <= b.t) {
+			const slug_t span = b.t - a.t;
+			const slug_t u = span > 0_cv ? (t - a.t) / span : 1_cv;
+
+			return {
+				a.color.r + (b.color.r - a.color.r) * u,
+				a.color.g + (b.color.g - a.color.g) * u,
+				a.color.b + (b.color.b - a.color.b) * u,
+				a.color.a + (b.color.a - a.color.a) * u,
+			};
+		}
+	}
+
+	return g.stops.back().color;
+}
+
+// The em-space window an Image samples (see renderComposite()). linear: colors and gradient
+// stops go through the sRGB EOTF before compositing (alpha unchanged), so the image is composited
+// in linear light like a GPU fed linear colors (the slug.elf wire); default: as authored.
+struct Window {
+	slug_t emX0 = 0_cv, emY0 = 0_cv;
+	slug_t emWidth = 1_cv, emHeight = 1_cv;
+	bool linear = false;
+};
+
+inline slug_t srgbToLinear(slug_t c) {
+	c = std::clamp(c, 0_cv, 1_cv);
+
+	return c <= 0.04045_cv ? c / 12.92_cv : slug_t(std::pow((c + 0.055_cv) / 1.055_cv, 2.4_cv));
+}
+
+inline Color toLinear(const Color& c) { return {srgbToLinear(c.r), srgbToLinear(c.g), srgbToLinear(c.b), c.a}; }
+
+inline GradientInfo toLinear(GradientInfo g) {
+	for(auto& st : g.stops) st.color = toLinear(st.color);
+
+	return g;
+}
+
+// Premultiplied src-over of straight color @p c at coverage @p cov into pixel (i, j).
+inline void blendPixel(Image& img, uint32_t i, uint32_t j, const Color& c, slug_t cov) {
+	const slug_t a = c.a * cov;
+	slug_t* d = &img.data[(size_t(j) * img.width + size_t(i)) * 4];
+
+	d[0] = c.r * a + d[0] * (1_cv - a);
+	d[1] = c.g * a + d[1] * (1_cv - a);
+	d[2] = c.b * a + d[2] * (1_cv - a);
+	d[3] = a + d[3] * (1_cv - a);
+}
+
+// Composites one ordinary (shape-backed) layer into @p img. Layers with no shape in the atlas
+// are skipped (renderComposite() callers that know other layer kinds - slughorn/stamp.hpp -
+// handle those themselves).
+inline void renderLayer(Image& img, const Atlas& atlas, const Layer& layer, const Window& win) {
+	if(layer.drawMode != DrawMode::Visible || !img.width || !img.height) return;
+
+	const auto info = atlas.getShape(layer.key);
+
+	if(!info || info->curves.empty()) return;
+
+	const slug_t ppeX = cv(img.width) / win.emWidth;
+	const slug_t ppeY = cv(img.height) / win.emHeight;
+	const auto& gradients = atlas.getGradients();
+
+	const Sampler sampler = decode(atlas, layer.key);
+	const Atlas::Shape& sh = sampler.shape;
+	const slug_t s = layer.scale;
+
+	// Local (curve-space) = (canvas - placement) / scale; placement per Shape::computeQuad.
+	const slug_t px = (layer.transform.x - sh.originX) * s;
+	const slug_t py = (layer.transform.y - sh.originY) * s;
+
+	const Quad q = sh.computeQuad(layer.transform, s);
+
+	const GradientInfo* grad = (layer.gradientId > 0 && layer.gradientId <= gradients.size())
+		? &gradients[layer.gradientId - 1]
+		: nullptr
+	;
+
+	GradientInfo linearGrad;
+
+	if(grad && win.linear) {
+		linearGrad = toLinear(*grad);
+		grad = &linearGrad;
+	}
+
+	const Color layerColor = win.linear ? toLinear(layer.color) : layer.color;
+
+	const auto i0 = static_cast<int64_t>(std::floor((q.x0 - win.emX0) * ppeX)) - 1;
+	const auto i1 = static_cast<int64_t>(std::ceil((q.x1 - win.emX0) * ppeX)) + 1;
+	const auto j0 = static_cast<int64_t>(std::floor((q.y0 - win.emY0) * ppeY)) - 1;
+	const auto j1 = static_cast<int64_t>(std::ceil((q.y1 - win.emY0) * ppeY)) + 1;
+
+	for(int64_t j = std::max<int64_t>(j0, 0); j < std::min<int64_t>(j1, img.height); j++) {
+		for(int64_t i = std::max<int64_t>(i0, 0); i < std::min<int64_t>(i1, img.width); i++) {
+			const slug_t ex = win.emX0 + (cv(i) + 0.5_cv) / ppeX;
+			const slug_t ey = win.emY0 + (cv(j) + 0.5_cv) / ppeY;
+			const slug_t lx = (ex - px) / s;
+			const slug_t ly = (ey - py) / s;
+
+			const slug_t cov = std::clamp(sampler.renderSampleBanded(lx, ly, ppeX * s, ppeY * s).fill, 0_cv, 1_cv);
+
+			if(cov <= 0_cv) continue;
+
+			Color c = layerColor;
+
+			if(grad) {
+				const Color gc = gradientColor(*grad, gradientT(*grad, lx, ly));
+
+				c = { gc.r, gc.g, gc.b, gc.a * layer.color.a };
+			}
+
+			blendPixel(img, uint32_t(i), uint32_t(j), c, cov);
+		}
+	}
+}
+
+inline Image renderComposite(
+	const Atlas& atlas,
+	const CompositeShape& composite,
+	uint32_t width,
+	uint32_t height,
+	slug_t emX0=0_cv,
+	slug_t emY0=0_cv,
+	slug_t emWidth=1_cv,
+	slug_t emHeight=1_cv,
+	bool linear=false
+) {
+	Image img{width, height, std::vector<slug_t>(size_t(width) * height * 4, 0_cv)};
+
+	if(!width || !height || emWidth <= 0_cv || emHeight <= 0_cv) return img;
+
+	const Window win{emX0, emY0, emWidth, emHeight, linear};
+
+	for(const auto& layer : composite.layers) renderLayer(img, atlas, layer, win);
+
+	return img;
 }
 
 // ================================================================================================

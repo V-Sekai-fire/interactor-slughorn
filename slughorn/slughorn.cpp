@@ -12,6 +12,10 @@
 #include "freetype.hpp"
 #endif
 
+#ifdef SLUGHORN_THORVG_IMPLEMENTATION
+#include "thorvg.hpp"
+#endif
+
 #ifdef SLUGHORN_HAS_SDF
 #include "render.hpp"
 #endif

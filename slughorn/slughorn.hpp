@@ -552,6 +552,20 @@ enum class BlendMode: uint8_t {
 };
 
 // ================================================================================================
+// FillRule
+//
+// Authoring-time fill rule of a source path (SVG fill-rule / clip-rule). The Slug coverage shader
+// itself is nonzero-only: backends that load even-odd content convert it to an equivalent nonzero
+// winding on the CPU (see nanosvg.hpp / thorvg.hpp). The original rule is still worth carrying
+// alongside a Layer for consumers that re-derive regions from the curves (e.g. polygon boolean
+// normalization before tessellation, slughorn/clipper.hpp), since even-odd is winding-agnostic.
+// ================================================================================================
+enum class FillRule: uint8_t {
+	NonZero = 0,
+	EvenOdd = 1,
+};
+
+// ================================================================================================
 // Mask
 //
 // Per-layer mask specification. Exactly one of two sources drives shape coverage:
@@ -1811,6 +1825,14 @@ struct CurveDecomposer {
 	// em-normalized [0,1] geometry.
 	slug_t tolerance = TOLERANCE_EXACT;
 
+	// When true, `tolerance` bounds the distance between a cubic and the two quadratics emitted for
+	// it instead of the cubic's flatness: the leaf's parametric error |C(t) - Q(s)| at s = 1/4, 1/2,
+	// 3/4 of each half (it vanishes at both ends of each half, so this tracks its maximum; and a
+	// parametric distance is never below the geometric one). Same accuracy from far fewer curves:
+	// the flatness test keeps splitting long after the quadratic leaf is already exact enough (a
+	// circle of radius 120 needs 16 quadratics a quadrant for 0.01 under the flatness test's 256).
+	bool errorBound = false;
+
 	slug_t _x = 0_cv;
 	slug_t _y = 0_cv;
 	slug_t _sx = 0_cv;
@@ -1959,6 +1981,41 @@ private:
 		;
 	}
 
+	// errorBound: the two-quadratic leaf (_emitTwoQuads) stays within `tolerance` of the cubic.
+	bool _leafErrorWithin(
+		slug_t p0x, slug_t p0y,
+		slug_t p1x, slug_t p1y,
+		slug_t p2x, slug_t p2y,
+		slug_t p3x, slug_t p3y
+	) const {
+		const double mx = (double(p0x) + 3.0 * p1x + 3.0 * p2x + p3x) * 0.125;
+		const double my = (double(p0y) + 3.0 * p1y + 3.0 * p2y + p3y) * 0.125;
+
+		// The leaf's quadratics: (p0, (p0 + 3 p1) / 4, m) and (m, (3 p2 + p3) / 4, p3).
+		const double q[2][6] = {
+			{double(p0x), double(p0y), (double(p0x) + 3.0 * p1x) * 0.25, (double(p0y) + 3.0 * p1y) * 0.25, mx, my},
+			{mx, my, (3.0 * p2x + double(p3x)) * 0.25, (3.0 * p2y + double(p3y)) * 0.25, double(p3x), double(p3y)}
+		};
+
+		const double tol2 = double(tolerance) * double(tolerance);
+
+		for(int half = 0; half < 2; half++) {
+			for(double sv : {0.25, 0.5, 0.75}) {
+				const double t = (half + sv) * 0.5, u = 1.0 - t;
+				const double cx = u * u * u * p0x + 3.0 * u * u * t * p1x + 3.0 * u * t * t * p2x + t * t * t * p3x;
+				const double cy = u * u * u * p0y + 3.0 * u * u * t * p1y + 3.0 * u * t * t * p2y + t * t * t * p3y;
+				const double w = 1.0 - sv;
+				const double qx = w * w * q[half][0] + 2.0 * w * sv * q[half][2] + sv * sv * q[half][4];
+				const double qy = w * w * q[half][1] + 2.0 * w * sv * q[half][3] + sv * sv * q[half][5];
+				const double ex = cx - qx, ey = cy - qy;
+
+				if(ex * ex + ey * ey > tol2) return false;
+			}
+		}
+
+		return true;
+	}
+
 	// Emit the flat-enough (or max-depth) cubic as two quadratics via midpoint split.
 	// This is the leaf operation - matches the original cubicTo behavior and NanoSVG convention.
 	void _emitTwoQuads(
@@ -1994,7 +2051,12 @@ private:
 		slug_t p3x, slug_t p3y,
 		size_t depth
 	) {
-		if(depth >= MAX_DEPTH || _flatEnough(p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y)) {
+		const bool leaf = errorBound
+			? _leafErrorWithin(p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y)
+			: _flatEnough(p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y)
+		;
+
+		if(depth >= MAX_DEPTH || leaf) {
 			_emitTwoQuads(p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y);
 
 			return;

@@ -1,0 +1,36 @@
+diff --git a/src/renderer/sw_engine/tvgSwStroke.cpp b/src/renderer/sw_engine/tvgSwStroke.cpp
+index d7499f9e..1654cd82 100644
+--- a/src/renderer/sw_engine/tvgSwStroke.cpp
++++ b/src/renderer/sw_engine/tvgSwStroke.cpp
+@@ -727,11 +727,30 @@ void strokeFree(SwStroke* stroke)
+ }
+ 
+ 
++//slughorn patch (thorvg-01-stroke-width-precision): strokeReset() converts the HALF stroke width
++//to 26.6 fixed point in LOCAL units and scales offsets afterwards, which quantizes a stroke to
++//1/64 of a local unit: a 0.05-unit stroke under a x120 transform is drawn 3.75 px wide instead of
++//6, and one under 1/32 of a unit vanishes. With swStrokePrecise set, the width is held in units of
++//1/f local units (f = the transform's scale rounded down to a power of two) and sx / sy are divided
++//by f: every SCALE()d offset and every local length (delta / sx) changes by the same exact factor,
++//so only the precision changes. Off by default (stock behaviour).
++namespace tvg { bool swStrokePrecise = false; }
++
+ void strokeReset(SwStroke* stroke, const RenderShape* rshape, const Matrix& transform, SwMpool* mpool, unsigned tid)
+ {
+     stroke->sx = sqrtf(powf(transform.e11, 2.0f) + powf(transform.e21, 2.0f));
+     stroke->sy = sqrtf(powf(transform.e12, 2.0f) + powf(transform.e22, 2.0f));
+-    stroke->width = HALF_STROKE(rshape->strokeWidth());
++    auto width = rshape->strokeWidth();
++    if (tvg::swStrokePrecise) {
++        auto s = (stroke->sx > stroke->sy) ? stroke->sx : stroke->sy;
++        if (s > 1.0f) {
++            auto f = exp2f(floorf(log2f(s)));
++            stroke->sx /= f;
++            stroke->sy /= f;
++            width *= f;
++        }
++    }
++    stroke->width = HALF_STROKE(width);
+     stroke->cap = rshape->strokeCap();
+     stroke->miterlimit = static_cast<int64_t>(rshape->strokeMiterlimit() * 65536.0f);
+ 

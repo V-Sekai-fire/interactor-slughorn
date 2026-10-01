@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""
+slughorn-thorvg-pack - pack a directory of <key>.svg files into ONE slughorn atlas.
+
+Every <key>.svg is loaded with ThorVG (slughorn.thorvg), its same-solid-paint layers are merged
+(slughorn.bake.merge_layers), and it is registered as one named CompositeShape <key> whose layer
+shapes are named "<key>/l_<n>". After the atlas is built each key is also baked into a planar
+triangle mesh from the atlas's own contours (slughorn.bake.bake_mesh) and gets a cost record.
+
+Output directory (all little-endian):
+
+  atlas.slugb   slughorn serial binary container (slughorn/serial.hpp): curve texture RGBA32F,
+                band texture RG16UI, gradient texture RGBA8 (only if any gradient), shapes,
+                composites (one per key). --format slug writes atlas.slug (JSON + base64) instead.
+  pack.json     per-key index: SVG width/height, em scale, merge stats, cost record, and glTF-style
+                accessors into pack.bin for the baked mesh. See the "format" block it contains.
+  pack.bin      baked mesh data referenced by pack.json's bufferViews.
+
+Usage:
+
+  slughorn-thorvg-pack SVG_DIR OUT_DIR [--tolerance-px 0.25] [--no-merge] [--format slugb|slug]
+"""
+
+import argparse
+import importlib
+import json
+import struct
+import sys
+from pathlib import Path
+
+
+def import_compiled_slughorn():
+	try:
+		mod = importlib.import_module("slughorn")
+	except ImportError as exc:
+		print(f"ERROR: failed to import compiled slughorn module: {exc}", file=sys.stderr)
+		sys.exit(1)
+
+	for sub in ("thorvg", "bake"):
+		if not hasattr(mod, sub):
+			print(f"ERROR: slughorn was built without slughorn.{sub} (need SLUGHORN_THORVG, "
+				"SLUGHORN_TESSELLATE and SLUGHORN_CLIPPER2)", file=sys.stderr)
+			sys.exit(1)
+
+	return mod
+
+
+slughorn = import_compiled_slughorn()
+
+GL_UNSIGNED_SHORT = 5123
+GL_UNSIGNED_INT = 5125
+GL_FLOAT = 5126
+
+FORMAT_DOC = {
+	"atlas": "slughorn serial (slughorn/serial.hpp); composite key {type:name, value:<key>} per SVG",
+	"shape_keys": "<key>/l_<n>, n = merged layer index",
+	"em_space": "em = svg_px / width (x right, y DOWN); layer transform (x, y) = local origin in em",
+	"uv": "u = x_px / width, v = 1 - y_px / height (v up, three.js/OpenGL convention)",
+	"winding": "every baked triangle is counter-clockwise in (u, v)",
+	"POSITION": "float32 VEC2 (u, v)",
+	"PAINT": "uint32 SCALAR, index into the key's paints[]",
+	"PARAM": "float32 VEC2: linear (t, 0); radial (gx, gy) with t = length(gx, gy) - inner_radius; solid (0, 0)",
+	"indices": "uint32 SCALAR triangle list; [0, opaque_index_count) planar opaque set (no overlaps, any "
+		"order), then overlay_index_count indices drawn after it in order with alpha blending",
+	"colors": "straight (non-premultiplied) RGBA floats, sRGB-encoded as authored (same as atlas layer colors); "
+		"layer opacity already multiplied into alpha",
+}
+
+
+def paint_json(p):
+	out = {
+		"type": {0: "solid", 1: "linear", 2: "radial"}[int(p.type)],
+		"opaque": bool(p.opaque),
+	}
+
+	if int(p.type) == 0:
+		c = p.color
+		out["color"] = [c.r, c.g, c.b, c.a]
+	else:
+		out["stops"] = [[s.t, s.color.r, s.color.g, s.color.b, s.color.a] for s in p.stops]
+		out["spread"] = {0: "pad", 1: "reflect", 2: "repeat"}.get(int(p.spread), "pad")
+
+		if int(p.type) == 2:
+			out["inner_radius"] = p.inner_radius
+
+	return out
+
+
+class BinWriter:
+	def __init__(self):
+		self.data = bytearray()
+		self.views = []
+		self.accessors = []
+
+	def add(self, raw: bytes, component_type: int, count: int, type_: str, extra=None) -> int:
+		while len(self.data) % 4:
+			self.data.append(0)
+
+		self.views.append({"buffer": 0, "byteOffset": len(self.data), "byteLength": len(raw)})
+		self.data.extend(raw)
+
+		acc = {"bufferView": len(self.views) - 1, "componentType": component_type, "count": count, "type": type_}
+
+		if extra:
+			acc.update(extra)
+
+		self.accessors.append(acc)
+
+		return len(self.accessors) - 1
+
+
+def main():
+	ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+	ap.add_argument("svg_dir", type=Path)
+	ap.add_argument("out_dir", type=Path)
+	ap.add_argument("--tolerance-px", type=float, default=0.25,
+		help="mesh flattening chord tolerance in texture (SVG) pixels (default 0.25)")
+	ap.add_argument("--no-merge", action="store_true", help="keep one layer per SVG paint")
+	ap.add_argument("--format", choices=("slugb", "slug"), default="slugb")
+	ap.add_argument("-q", "--quiet", action="store_true")
+	args = ap.parse_args()
+
+	svgs = sorted(args.svg_dir.glob("*.svg"))
+
+	if not svgs:
+		print(f"ERROR: no *.svg in {args.svg_dir}", file=sys.stderr)
+		return 1
+
+	args.out_dir.mkdir(parents=True, exist_ok=True)
+
+	atlas = slughorn.Atlas()
+	entries = {}
+	merged_by_key = {}
+
+	for svg in svgs:
+		key = svg.stem
+		warnings = []
+
+		cfg = slughorn.thorvg.LoadConfig()
+		cfg.log = lambda level, msg, w=warnings: w.append(msg)
+
+		staging = slughorn.Atlas()
+		loaded = slughorn.thorvg.load_file(str(svg), staging, slughorn.KeyIterator("s", True), config=cfg)
+
+		if cfg.width <= 0:
+			print(f"WARNING: {svg.name}: failed to load ({'; '.join(warnings)})", file=sys.stderr)
+			continue
+
+		meta = [slughorn.bake.LayerSource(l.fill_rule, l.stroke, int(l.spread)) for l in cfg.layers]
+		merged = slughorn.bake.merge_layers(staging, loaded, meta, atlas, slughorn.KeyIterator(key + "/l"), not args.no_merge)
+
+		atlas.add_composite_shape(slughorn.Key(key), merged.composite)
+		merged_by_key[key] = merged
+
+		entries[key] = {
+			"composite": {"type": "name", "value": key},
+			"width": cfg.width,
+			"height": cfg.height,
+			"height_em": cfg.height_em,
+			"em_per_px": 1.0 / cfg.width,
+			"layers_before": merged.layers_before,
+			"layers_after": merged.layers_after,
+			"curves_before": merged.curves_before,
+			"curves_after": merged.curves_after,
+			"stroke_layers": sum(1 for l in cfg.layers if l.stroke),
+			"clipped_layers": sum(1 for l in cfg.layers if l.clipped),
+			"warnings": sorted(set(warnings)),
+		}
+
+		if not args.quiet:
+			print(f"{key}: {cfg.width:g}x{cfg.height:g} px, layers {merged.layers_before} -> {merged.layers_after}, "
+				f"curves {merged.curves_before} -> {merged.curves_after}")
+
+	atlas.build()
+
+	atlas_name = "atlas." + args.format
+	slughorn.write(atlas, str(args.out_dir / atlas_name))
+
+	bin_ = BinWriter()
+
+	for key, merged in merged_by_key.items():
+		e = entries[key]
+		bc = slughorn.bake.BakeConfig(e["width"], e["height"], args.tolerance_px, True, True)
+		mesh = slughorn.bake.bake_mesh(atlas, merged.composite, merged.layers, bc)
+		cost = slughorn.bake.cost(atlas, merged.composite, mesh, merged.layers_before, 1.0, e["height_em"])
+
+		pos = bytes(memoryview(mesh.positions).cast("B"))
+		pid = bytes(memoryview(mesh.paint_ids).cast("B"))
+		par = bytes(memoryview(mesh.params).cast("B"))
+		idx = bytes(memoryview(mesh.indices).cast("B"))
+		nverts = len(pos) // 8
+
+		mesh_entry = {
+			"vertex_count": nverts,
+			"opaque_index_count": mesh.opaque_index_count,
+			"overlay_index_count": mesh.overlay_index_count,
+			"triangles_before": mesh.triangles_before,
+			"triangles_after": mesh.triangles_after,
+			"tolerance_px": mesh.tolerance_px,
+			"paints": [paint_json(p) for p in mesh.paints],
+		}
+
+		if nverts:
+			us, vs = memoryview(mesh.positions).cast("B").cast("f")[0::2], memoryview(mesh.positions).cast("B").cast("f")[1::2]
+			mesh_entry["attributes"] = {
+				"POSITION": bin_.add(pos, GL_FLOAT, nverts, "VEC2", {"min": [min(us), min(vs)], "max": [max(us), max(vs)]}),
+				"PAINT": bin_.add(pid, GL_UNSIGNED_INT, nverts, "SCALAR"),
+				"PARAM": bin_.add(par, GL_FLOAT, nverts, "VEC2"),
+			}
+			mesh_entry["indices"] = bin_.add(idx, GL_UNSIGNED_INT, len(idx) // 4, "SCALAR")
+
+		e["mesh"] = mesh_entry
+		e["cost"] = {
+			"curves": cost.curves,
+			"max_band_curves_h": cost.max_band_curves_h,
+			"max_band_curves_v": cost.max_band_curves_v,
+			"slug_work": cost.slug_work,
+			"slug_work_mean": cost.slug_work_mean,
+			"layers_after_merge": cost.layers_after,
+			"gradient_layers": cost.gradient_layers,
+			"baked_triangles": cost.triangles_after,
+			"mode": cost.mode,
+		}
+
+		if not args.quiet:
+			print(f"{key}: curves={cost.curves} band h/v={cost.max_band_curves_h}/{cost.max_band_curves_v} work~{cost.slug_work_mean:.0f} "
+				f"tris {mesh.triangles_before}->{mesh.triangles_after} mode={cost.mode}")
+
+	(args.out_dir / "pack.bin").write_bytes(bytes(bin_.data))
+
+	stats = atlas.packing_stats if hasattr(atlas, "packing_stats") else None
+
+	index = {
+		"asset": {"generator": "slughorn-thorvg-pack", "version": "1"},
+		"format": FORMAT_DOC,
+		"atlas": atlas_name,
+		"tex_width": atlas.curve_texture.width,
+		"textures": {
+			"curve": {"format": str(atlas.curve_texture.format).split(".")[-1], "width": atlas.curve_texture.width, "height": atlas.curve_texture.height},
+			"band": {"format": str(atlas.band_texture.format).split(".")[-1], "width": atlas.band_texture.width, "height": atlas.band_texture.height},
+		},
+		"tolerance_px": args.tolerance_px,
+		"thresholds": {
+			"max_merged_curves": slughorn.bake.MAX_MERGED_CURVES,
+			"mesh_triangles_max": slughorn.bake.MESH_TRIANGLES_MAX,
+			"slug_work_mean_max": slughorn.bake.SLUG_WORK_MEAN_MAX,
+			"slug_layers_max": slughorn.bake.SLUG_LAYERS_MAX,
+			"mesh_triangles_hard_max": slughorn.bake.MESH_TRIANGLES_HARD_MAX,
+		},
+		"buffers": [{"uri": "pack.bin", "byteLength": len(bin_.data)}],
+		"bufferViews": bin_.views,
+		"accessors": bin_.accessors,
+		"keys": entries,
+	}
+
+	(args.out_dir / "pack.json").write_text(json.dumps(index, indent=1))
+
+	if not args.quiet:
+		print(f"wrote {args.out_dir / atlas_name}, pack.json, pack.bin ({len(entries)} keys)")
+
+	return 0
+
+
+if __name__ == "__main__":
+	sys.exit(main())

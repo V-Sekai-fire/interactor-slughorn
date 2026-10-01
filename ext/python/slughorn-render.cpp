@@ -170,6 +170,48 @@ void bind_render(py::module_& render) {
 		})
 	;
 
+	py::class_<slughorn::render::Image>(render, "Image", py::buffer_protocol(),
+		"Premultiplied RGBA float image from render_composite(); buffer shape (height, width, 4).")
+		.def_readonly("width", &slughorn::render::Image::width)
+		.def_readonly("height", &slughorn::render::Image::height)
+		.def_buffer([](slughorn::render::Image& img) -> py::buffer_info {
+			return py::buffer_info(
+				img.data.data(),
+				sizeof(slug_t),
+				py::format_descriptor<slug_t>::format(),
+				3,
+				{ static_cast<py::ssize_t>(img.height), static_cast<py::ssize_t>(img.width), py::ssize_t(4) },
+				{
+					static_cast<py::ssize_t>(sizeof(slug_t) * 4 * img.width),
+					static_cast<py::ssize_t>(sizeof(slug_t) * 4),
+					static_cast<py::ssize_t>(sizeof(slug_t))
+				}
+			);
+		})
+		.def("__repr__", [](const slughorn::render::Image& img) {
+			return "Image(" + std::to_string(img.width) + "x" + std::to_string(img.height) + ")";
+		})
+	;
+
+	render.def("render_composite",
+		[](
+			const slughorn::Atlas& atlas,
+			const slughorn::CompositeShape& composite,
+			uint32_t width, uint32_t height,
+			slug_t emX0, slug_t emY0, slug_t emWidth, slug_t emHeight
+		) {
+			py::gil_scoped_release release;
+
+			return slughorn::render::renderComposite(atlas, composite, width, height, emX0, emY0, emWidth, emHeight);
+		},
+		"atlas"_a, "composite"_a, "width"_a, "height"_a,
+		"em_x0"_a=0_cv, "em_y0"_a=0_cv, "em_width"_a=1_cv, "em_height"_a=1_cv,
+		"CPU reference render of a whole CompositeShape (band coverage + layer color/gradient,\n"
+		"src-over) over the em window [em_x0, em_x0+em_width) x [em_y0, em_y0+em_height).\n"
+		"Row 0 is the window's low em-y edge (the top of an SVG-loaded picture).\n"
+		"Returns an Image; np.asarray(img) is (height, width, 4) premultiplied float32."
+	);
+
 	render.def("decode",
 		[](const slughorn::Atlas& atlas, slughorn::Key key) {
 			return slughorn::render::decode(atlas, key);

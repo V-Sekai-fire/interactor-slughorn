@@ -19,15 +19,30 @@
 // pattern produces correctly outward-facing normals for both without any special-casing.
 //
 // Requires SLUGHORN_TESSELLATE=ON (vendors ext/earcut.hpp; header-only, no link dependency).
+//
+// FILL-RULE-ROBUST TESSELLATION (SLUGHORN_CLIPPER2=ON)
+// ----------------------------------------------------
+// tessellate(contours, tolerance) above trusts each ring's signed area to say exterior vs hole.
+// That breaks on mis-wound input (fonts with a counter wound like its outline, SVG even-odd
+// paths, overlapping sub-paths). tessellate(contours, tolerance, FillRule) instead resolves the
+// flattened rings with a Clipper2 union under the given fill rule first (clipper::normalize), so
+// windings are rebuilt from the region itself, then triangulates the resulting PolyTree
+// (outer -> holes -> islands nesting comes straight from Clipper2, no containment guessing).
+// triangulate(region) does the second half for any already-normalized region.
 // ================================================================================================
 
 #include "slughorn.hpp"
 
 #include <mapbox/earcut.hpp>
 
+#ifdef SLUGHORN_HAS_CLIPPER2
+#include "clipper.hpp"
+#endif
+
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <vector>
 
@@ -308,6 +323,70 @@ inline Mesh3D extrude(
 
 	return mesh;
 }
+
+
+#ifdef SLUGHORN_HAS_CLIPPER2
+
+// Triangulates an already-normalized region (clipper::normalize / unite / intersect /
+// difference output) through Clipper2's PolyTree nesting. Vertex positions are in the region's
+// own coordinate space.
+inline Mesh2D triangulate(const clipper::Paths& region) {
+	using namespace detail;
+
+	Mesh2D mesh;
+
+	if(region.empty()) return mesh;
+
+	Clipper2Lib::ClipperD c(clipper::precisionFor(region));
+
+	c.AddSubject(region);
+
+	Clipper2Lib::PolyTreeD tree;
+
+	c.Execute(Clipper2Lib::ClipType::Union, Clipper2Lib::FillRule::NonZero, tree);
+
+	auto toRing = [](const clipper::Path& p) {
+		Ring r;
+
+		r.reserve(p.size());
+
+		for(const auto& pt : p) r.push_back({static_cast<slug_t>(pt.x), static_cast<slug_t>(pt.y)});
+
+		return r;
+	};
+
+	std::function<void(const Clipper2Lib::PolyPathD&)> emitOuter = [&](const Clipper2Lib::PolyPathD& outer) {
+		std::vector<Ring> polygon;
+
+		polygon.push_back(toRing(outer.Polygon()));
+
+		for(const auto& hole : outer) polygon.push_back(toRing(hole->Polygon()));
+
+		const auto base = static_cast<uint32_t>(mesh.positions.size() / 2);
+
+		for(uint32_t idx : mapbox::earcut<uint32_t>(polygon)) mesh.indices.push_back(base + idx);
+
+		for(const auto& ring : polygon) for(const auto& p : ring) {
+			mesh.positions.push_back(p[0]);
+			mesh.positions.push_back(p[1]);
+		}
+
+		for(const auto& hole : outer) for(const auto& island : *hole) emitOuter(*island);
+	};
+
+	for(const auto& outer : tree) emitOuter(*outer);
+
+	return mesh;
+}
+
+// Fill-rule-robust tessellation: flatten, resolve windings with a Clipper2 union under @p rule,
+// triangulate. Correct for mis-wound / self-overlapping contours where the signed-area overload
+// is not.
+inline Mesh2D tessellate(const Atlas::Contours& contours, slug_t tolerance, FillRule rule) {
+	return triangulate(clipper::normalize(clipper::toPaths(contours, tolerance), rule));
+}
+
+#endif
 
 }
 }

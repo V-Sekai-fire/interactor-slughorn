@@ -25,16 +25,15 @@
 //   [length:  uint32_t total bytes]
 //
 //   Chunk 0 - JSON
-//     [chunk_length: uint32_t          ]  byte count of JSON data (before padding)
+//     [chunk_length: uint32_t          ]  byte count of JSON data INCLUDING its padding (always % 4 == 0)
 //     [chunk_type:   uint32_t 0x4E4F534A "JSON"]
-//     [data:         chunk_length bytes, UTF-8 ]
-//     [padding:      0-3 bytes 0x20 (space) to reach 4-byte alignment]
+//     [data:         UTF-8, padded with 0-3 bytes 0x20 (space) to 4-byte alignment; the padding is
+//                    part of chunk_length, as in glTF .glb]
 //
 //   Chunk 1 - BIN
-//     [chunk_length: uint32_t          ]  byte count of binary data (before padding)
+//     [chunk_length: uint32_t          ]  byte count of binary data INCLUDING its padding (% 4 == 0)
 //     [chunk_type:   uint32_t 0x004E4942 "BIN\0"]
-//     [data:         chunk_length bytes ]
-//     [padding:      0-3 bytes 0x00 to reach 4-byte alignment]
+//     [data:         padded with 0-3 bytes 0x00 to 4-byte alignment; padding counted in chunk_length]
 //
 // JSON schema
 // -----------
@@ -84,8 +83,11 @@
 //           {
 //             "key": { "type": "codepoint", "value": 80 },
 //             "color": [1.0, 0.0, 0.0, 1.0],
-//             "transform": [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-//             "effect_id": 0
+//             "transform": [0.0, 0.0, 0.0],   // Layer::transform x, y, z (em-space placement)
+//             "effect_id": 0, "effect_param": 0.0,
+//             "gradient_id": 0,               // 1-based into "gradients"; 0 = flat color
+//             "draw_mode": 0, "blend_mode": 0
+//             // NOT serialized: Layer::scale, Layer::bleed, CompositeShape::mask
 //           }
 //         ]
 //       }

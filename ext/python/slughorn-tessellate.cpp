@@ -43,6 +43,18 @@ void bind_tessellate(py::module_& tessellate) {
 		"more holes. Returns a Mesh2D."
 	);
 
+#ifdef SLUGHORN_HAS_CLIPPER2
+	tessellate.def("tessellate",
+		[](const PyShapeContours& contours, slug_t tolerance, slughorn::FillRule rule) {
+			return slughorn::tessellate::tessellate(contoursFromCSR(contours), tolerance, rule);
+		},
+		"contours"_a, "tolerance"_a, "fill_rule"_a,
+		"Fill-rule-robust variant (SLUGHORN_CLIPPER2): resolves the flattened rings with a\n"
+		"Clipper2 union under fill_rule (slughorn.FillRule) before triangulating, so mis-wound\n"
+		"or self-overlapping contours are handled by the rule instead of by signed area."
+	);
+#endif
+
 	tessellate.def("extrude",
 		[](const PyShapeContours& contours, slug_t depth, slug_t tolerance) {
 			return slughorn::tessellate::extrude(contoursFromCSR(contours), depth, tolerance);

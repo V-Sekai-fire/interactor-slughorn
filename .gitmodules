@@ -13,3 +13,9 @@
 [submodule "ext/earcut"]
 	path = ext/earcut
 	url = https://github.com/mapbox/earcut.hpp
+[submodule "ext/thorvg"]
+	path = ext/thorvg
+	url = https://github.com/thorvg/thorvg
+[submodule "ext/clipper2"]
+	path = ext/clipper2
+	url = https://github.com/AngusJohnson/Clipper2
