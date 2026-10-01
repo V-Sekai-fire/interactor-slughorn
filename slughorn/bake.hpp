@@ -33,8 +33,13 @@
 #include "tessellate.hpp"
 #include "stamp.hpp"
 
+#ifdef SLUGHORN_HAS_MESHOPT
+#include <meshoptimizer.h>
+#endif
+
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <map>
 #include <optional>
 #include <cmath>
@@ -439,6 +444,9 @@ struct Paint {
 	bool opaque = false;
 };
 
+// How bakeFinal() treats the final composite's alpha (see there).
+enum class AlphaMode : uint8_t { Opaque = 0, Transparent = 1, AlphaTest = 2 };
+
 struct BakeConfig {
 	// Authoring size of the key in pixels (thorvg::LoadConfig width/height). Em-space is
 	// normalized by width (em = px / width), so width is also pixels-per-em.
@@ -460,6 +468,29 @@ struct BakeConfig {
 
 	// > 0: alpha-tested (cutout) bake - see bakeCutout(). 0: the planar base + overlay bake.
 	slug_t alphaTest = 0_cv;
+
+	// bakeFinal(): the material's alpha handling, its opacity (multiplies the final alpha) and
+	// the cell size (px) for faces under two or more gradients (0: CUTOUT_CELL_PX).
+	AlphaMode alphaMode = AlphaMode::AlphaTest;
+	slug_t opacity = 1_cv;
+	slug_t cellPx = 0_cv;
+
+	// bakeFinal(): bake only this rectangle of the canvas (authoring px, x0 < x1 and y0 < y1);
+	// empty = the whole canvas.
+	slug_t windowX0 = 0_cv, windowY0 = 0_cv, windowX1 = 0_cv, windowY1 = 0_cv;
+
+	// bakeFinal() LOD: features (connected components of a layer, stamp instances) whose size
+	// 2 * area / perimeter is below this many px are not geometry; they are folded into the mean
+	// colour of the face they sit on. 0 keeps everything.
+	slug_t featurePx = 0_cv;
+
+	// bakeFinal(): stop (BakedMesh::aborted) once the mesh passes this many triangles; 0 = no cap.
+	size_t maxTriangles = 0;
+
+	// bakeFinal() LOD: simplify every region's outline (Clipper2 SimplifyPaths, px) before the
+	// arrangement, so faces still share their boundaries exactly. Curves reach the bake already
+	// flattened (the loader's clip pass), so this - not tolerancePx - is what coarsens polylines.
+	slug_t simplifyPx = 0_cv;
 };
 
 struct BakedMesh {
@@ -496,6 +527,20 @@ struct BakedMesh {
 	// to be approximated at their centroid (stacks with two or more gradients).
 	slug_t alphaTest = 0_cv;
 	size_t cutoutApproxFaces = 0;
+
+	// bakeFinal(): the mode it baked, the area (authoring px^2) of the window and, in Opaque mode,
+	// of the faces whose final alpha is below 1 - transparent at the end on an opaque material,
+	// shown with their straight rgb (black where nothing was drawn).
+	AlphaMode alphaMode = AlphaMode::AlphaTest;
+	double canvasArea = 0.0;
+	double transparentArea = 0.0;
+
+	// bakeFinal() LOD: the feature size it kept (px), how many features (and how much area, px^2)
+	// it folded into face means, and whether it stopped at BakeConfig::maxTriangles.
+	slug_t featurePx = 0_cv;
+	size_t foldedFeatures = 0;
+	double foldedArea = 0.0;
+	bool aborted = false;
 };
 
 namespace detail {
@@ -590,28 +635,52 @@ inline Paint paintOf(const Atlas& atlas, const Layer& layer, const LayerSource& 
 }
 
 // ================================================================================================
-// bakeCutout - alpha-tested bake (what three.js alphaTest does with the original canvas)
+// bakeFinal - the FINAL composite as one opaque-or-alpha planar bake (no overlay)
 //
-// The key's layers (stamp instances included) are cut into their full planar arrangement: every
-// face of it is covered by a fixed stack of layers. Each face's source-over composite is known in
-// closed form, so a face is KEPT, as fully opaque geometry with the unpremultiplied composite
-// color, exactly where its composite alpha >= alphaTest, and dropped elsewhere. No overlay.
+// Every alpha source is folded into the layer stack and only the final composite is judged, the
+// way three.js shades a textured material: rgb = the colour key's composite (straight, as WebGL
+// un-premultiplies a canvas texture: 0 where its alpha is 0; white when there is no colour key),
+// alpha = colour alpha * opacity * (alpha map's straight GREEN channel, when there is an alpha-map
+// key - diffuseColor.a *= texture(alphaMap, uv).g). Per AlphaMode:
 //
-// - Faces whose stack is all solid paints: constant composite; kept or dropped whole.
-// - Faces with exactly one gradient (linear / radial / elliptical) and solids around it: the
-//   composite alpha is piecewise linear in the gradient parameter t (between stops), so the
-//   alphaTest iso-lines are lines of constant t: straight lines for a linear gradient (the face is
-//   clipped by half-planes, exact) and ellipses for a radial one (clipped by an annulus polygon at
-//   the bake tolerance). The kept part gets a gradient paint whose stops are the composite color
-//   at every original stop and crossing point (exact at those t, linear in between).
-// - Faces under two or more gradients (or a sweep): no closed form; subdivided into
-//   CUTOUT_CELL_PX cells, each kept / dropped with the composite at its center - counted in
-//   BakedMesh::cutoutApproxFaces.
+//   Opaque       every face kept, opaque, with the straight rgb (three.js ignores alpha on an
+//                opaque material); faces whose final alpha < 1 are measured in
+//                BakedMesh::transparentArea ("transparent at the end on an opaque material").
+//   Transparent  faces with final alpha > 0 kept, with that alpha in their paint (base-colour
+//                alpha): exact per vertex under one gradient, per cell under two or more.
+//   AlphaTest    faces with final alpha >= alphaTest kept, opaque, with the straight rgb (the
+//                cutout: what alphaTest discards is gone).
+//
+// The colour key's layers (stamp instances included) and the alpha-map key's layers (scaled onto
+// the colour key's UV square) are cut into one planar arrangement: every face of it is covered by
+// a fixed stack. Each face's composite is known in closed form:
+//
+// - stacks of solid paints: constant;
+// - exactly one gradient (linear / radial / elliptical; in either key): the final alpha is
+//   piecewise linear in the gradient parameter t between stops, so alpha-test iso-lines are lines
+//   of constant t - straight lines (half-planes, exact) for a linear gradient, ellipses (an annulus
+//   polygon at the bake tolerance) for a radial one; the kept part gets a gradient paint whose
+//   stops are the composite at every original stop and crossing (exact at those t, linear in
+//   between);
+// - two or more gradients (or a sweep): no closed form; cut into BakeConfig::cellPx cells, each
+//   kept / dropped and painted with the composite at its centre (BakedMesh::cutoutApproxFaces).
 // ================================================================================================
+
+// An alpha-map key: its composite's straight green multiplies the final alpha.
+struct AlphaSource {
+	const Atlas* atlas = nullptr;
+	const CompositeShape* composite = nullptr;
+	const std::vector<LayerSource>* meta = nullptr;
+	const stamp::Set* stamps = nullptr;
+
+	// Its authoring size (pixels); it is stretched onto the colour key's UV square.
+	slug_t width = 1_cv;
+	slug_t height = 1_cv;
+};
 
 namespace detail {
 
-// How one region paints, in authoring pixels.
+// How one region paints, in (colour key) authoring pixels.
 struct CutPaint {
 	const GradientInfo* g = nullptr; // nullptr = solid
 	Color color = {};                // solid straight color, or the gradient tint
@@ -679,106 +748,252 @@ inline clipper::Path slab(double alpha, double beta, double gamma, double lo, do
 	return poly;
 }
 
+// The final colour of a face: straight rgb of the colour stack, final alpha.
+struct Final {
+	double r = 0, g = 0, b = 0, a = 0;
+};
+
 }
 
-// Cell size (authoring px) for cutout faces under two or more gradients (no closed-form iso-line).
+// Cell size (authoring px) for faces under two or more gradients (no closed-form iso-line).
 inline constexpr double CUTOUT_CELL_PX = 1.0;
 
-inline BakedMesh bakeCutout(
+// Folded features take local means over cells no finer than canvas / FOLD_GRID.
+inline constexpr double FOLD_GRID = 32.0;
+
+// bakeFinal() gives up before tiling when the outlines carry more than this many vertices per
+// triangle of BakeConfig::maxTriangles.
+inline constexpr size_t HOPELESS_VERTICES_PER_TRIANGLE = 16;
+
+// A final alpha below this is "not opaque" (Opaque mode's transparentArea).
+inline constexpr double FINAL_OPAQUE_ALPHA = 1.0 - 0.5 / 255.0;
+
+// A composite ramp is refined until linear interpolation between its stops stays this close to
+// the composite (per channel), at most 2^RAMP_MAX_DEPTH stops an interval.
+inline constexpr double RAMP_TOLERANCE = 1.0 / 255.0;
+inline constexpr int RAMP_MAX_DEPTH = 6;
+
+inline BakedMesh bakeFinal(
 	const Atlas& atlas,
-	const CompositeShape& composite,
+	const CompositeShape* composite,       // nullptr: no colour key (white)
 	const std::vector<LayerSource>& meta,
 	const BakeConfig& cfg,
-	const stamp::Set* stamps=nullptr
+	const stamp::Set* stamps=nullptr,
+	const AlphaSource* alphaMap=nullptr
 ) {
 	using detail::CutPaint;
 	using detail::Premul;
+	using detail::Final;
 
 	BakedMesh mesh;
 
 	mesh.tolerancePx = cfg.tolerancePx;
-	mesh.alphaTest = cfg.alphaTest;
+	mesh.alphaTest = cfg.alphaMode == AlphaMode::AlphaTest ? cfg.alphaTest : 0_cv;
+	mesh.alphaMode = cfg.alphaMode;
 
-	const slug_t ppe = cfg.width;
-	const auto& gradients = atlas.getGradients();
+	const double W = cfg.width, H = cfg.height;
+
+	// The bake window (px): the whole canvas unless BakeConfig::window is set.
+	const bool windowed = cfg.windowX1 > cfg.windowX0 && cfg.windowY1 > cfg.windowY0;
+	const double wx0 = windowed ? std::max(0.0, double(cfg.windowX0)) : 0.0, wy0 = windowed ? std::max(0.0, double(cfg.windowY0)) : 0.0;
+	const double wx1 = windowed ? std::min(W, double(cfg.windowX1)) : W, wy1 = windowed ? std::min(H, double(cfg.windowY1)) : H;
+
+	if(!(wx1 > wx0 && wy1 > wy0)) return mesh;
+
+	mesh.canvasArea = (wx1 - wx0) * (wy1 - wy0);
 
 	struct Region {
 		clipper::Paths paths;
 		CutPaint paint;
+		bool alpha = false; // an alpha-map region
 	};
 
 	std::vector<Region> regions;
 
-	for(size_t li = 0; li < composite.layers.size(); li++) {
-		const Layer& layer = composite.layers[li];
+	auto inWindow = [&](const clipper::Paths& paths) {
+		for(const auto& p : paths) for(const auto& pt : p) if(pt.x >= wx0 && pt.x <= wx1 && pt.y >= wy0 && pt.y <= wy1) return true;
 
-		if(layer.drawMode != DrawMode::Visible) continue;
+		// No vertex inside: still overlapping when the boxes overlap (a big shape around the window).
+		double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
 
-		if(stamp::isStampLayer(layer)) {
-			if(!stamps || stamp::stampIndex(layer) >= stamps->layers.size()) continue;
+		for(const auto& p : paths) for(const auto& pt : p) { x0 = std::min(x0, pt.x); y0 = std::min(y0, pt.y); x1 = std::max(x1, pt.x); y1 = std::max(y1, pt.y); }
 
-			for(const stamp::Instance& in : stamps->layers[stamp::stampIndex(layer)].instances) {
-				if(in.color.a <= 0_cv) continue;
+		return x0 <= wx1 && x1 >= wx0 && y0 <= wy1 && y1 >= wy0;
+	};
 
-				auto paths = clipper::normalize(
-					clipper::toPaths(stamp::instanceContours(*stamps, in), cfg.tolerancePx, Matrix::scale(ppe, ppe)),
-					FillRule::NonZero
-				);
+	// LOD outline simplification (re-normalized: simplifying can make a ring cross itself).
+	auto simplify = [&](clipper::Paths& paths) {
+		if(cfg.simplifyPx <= 0_cv || paths.empty()) return;
 
-				if(paths.empty()) continue;
+		paths = clipper::normalize(Clipper2Lib::SimplifyPaths<double>(paths, double(cfg.simplifyPx), true), FillRule::NonZero);
+	};
 
-				CutPaint p;
+	// One composite's regions. em -> px is (x * sx, y * sy).
+	auto addComposite = [&](const Atlas& at, const CompositeShape& comp, const std::vector<LayerSource>& lmeta, const stamp::Set* st,
+			double sx, double sy, bool alpha) {
+		const auto& gradients = at.getGradients();
 
-				p.color = in.color;
+		for(size_t li = 0; li < comp.layers.size(); li++) {
+			const Layer& layer = comp.layers[li];
 
-				if(in.gradient && in.gradient <= stamps->gradients.size()) {
-					const stamp::Inverse inv = stamp::invert(in.m);
+			if(layer.drawMode != DrawMode::Visible) continue;
 
-					p.g = &stamps->gradients[in.gradient - 1];
-					p.toLocal = Matrix{.xx = inv.a / ppe, .yx = inv.c / ppe, .xy = inv.b / ppe, .yy = inv.d / ppe, .dx = inv.e, .dy = inv.f};
+			if(stamp::isStampLayer(layer)) {
+				if(!st || stamp::stampIndex(layer) >= st->layers.size()) continue;
+
+				for(const stamp::Instance& in : st->layers[stamp::stampIndex(layer)].instances) {
+					if(in.color.a <= 0_cv) continue;
+
+					// Cheap reject before flattening: the instance's box against the window.
+					const stamp::Box ib = stamp::bounds(in, *st);
+
+					if(double(ib.x1) * sx < wx0 || double(ib.x0) * sx > wx1 || double(ib.y1) * sy < wy0 || double(ib.y0) * sy > wy1) continue;
+
+					auto paths = clipper::normalize(
+						clipper::toPaths(stamp::instanceContours(*st, in), cfg.tolerancePx, Matrix{.xx = slug_t(sx), .yy = slug_t(sy)}),
+						FillRule::NonZero
+					);
+
+					if(paths.empty()) continue;
+
+					CutPaint p;
+
+					p.color = in.color;
+
+					if(in.gradient && in.gradient <= st->gradients.size()) {
+						const stamp::Inverse inv = stamp::invert(in.m);
+
+						p.g = &st->gradients[in.gradient - 1];
+						p.toLocal = Matrix{.xx = slug_t(inv.a / sx), .yx = slug_t(inv.c / sx), .xy = slug_t(inv.b / sy), .yy = slug_t(inv.d / sy), .dx = inv.e, .dy = inv.f};
+					}
+
+					regions.push_back({std::move(paths), p, alpha});
 				}
 
-				mesh.trianglesBefore += detail::triangulateTiled(paths).indices.size() / 3;
-				regions.push_back({std::move(paths), p});
+				continue;
 			}
 
-			continue;
+			const auto shape = at.getShape(layer.key);
+
+			if(!shape) continue;
+
+			const LayerSource src = li < lmeta.size() ? lmeta[li] : LayerSource{};
+
+			if(src.stroke && !alpha) mesh.strokeLayers++;
+
+			const double s = layer.scale;
+			const double ox = (double(layer.transform.x) - shape->originX) * s;
+			const double oy = (double(layer.transform.y) - shape->originY) * s;
+
+			auto paths = clipper::normalize(
+				clipper::toPaths(at.getShapeContours(layer.key), cfg.tolerancePx,
+					Matrix{.xx = slug_t(s * sx), .yy = slug_t(s * sy), .dx = slug_t(ox * sx), .dy = slug_t(oy * sy)}),
+				src.fillRule
+			);
+
+			if(paths.empty() || (windowed && !inWindow(paths))) continue;
+
+			CutPaint p;
+
+			p.color = layer.color;
+
+			if(layer.gradientId > 0 && layer.gradientId <= gradients.size()) {
+				p.g = &gradients[layer.gradientId - 1];
+				// local = (px / scale - o) / s
+				p.toLocal = Matrix{.xx = slug_t(1.0 / (sx * s)), .yy = slug_t(1.0 / (sy * s)), .dx = slug_t(-ox / s), .dy = slug_t(-oy / s)};
+			}
+
+			regions.push_back({std::move(paths), p, alpha});
 		}
+	};
 
-		const auto shape = atlas.getShape(layer.key);
+	// The canvas itself: white under no colour key; under a colour key in Opaque mode a clear
+	// background, so faces nothing covers still exist (they come out black, as WebGL un-premultiplies).
+	const clipper::Paths canvasRect{{{wx0, wy0}, {wx1, wy0}, {wx1, wy1}, {wx0, wy1}}};
+	size_t firstLayerRegion = 0;
 
-		if(!shape) continue;
+	if(!composite) {
+		CutPaint white;
 
-		const LayerSource src = li < meta.size() ? meta[li] : LayerSource{};
-
-		if(src.stroke) mesh.strokeLayers++;
-
-		const slug_t s = layer.scale;
-		const slug_t ox = (layer.transform.x - shape->originX) * s;
-		const slug_t oy = (layer.transform.y - shape->originY) * s;
-
-		auto paths = clipper::normalize(
-			clipper::toPaths(atlas.getShapeContours(layer.key), cfg.tolerancePx, Matrix{.xx = s * ppe, .yy = s * ppe, .dx = ox * ppe, .dy = oy * ppe}),
-			src.fillRule
-		);
-
-		if(paths.empty()) continue;
-
-		CutPaint p;
-
-		p.color = layer.color;
-
-		if(layer.gradientId > 0 && layer.gradientId <= gradients.size()) {
-			p.g = &gradients[layer.gradientId - 1];
-			// local = (px / ppe - o) / s
-			p.toLocal = Matrix{.xx = 1_cv / (ppe * s), .yy = 1_cv / (ppe * s), .dx = -ox / s, .dy = -oy / s};
-		}
-
-		mesh.trianglesBefore += detail::triangulateTiled(paths).indices.size() / 3;
-		regions.push_back({std::move(paths), p});
+		white.color = {1_cv, 1_cv, 1_cv, 1_cv};
+		regions.push_back({canvasRect, white, false});
+		firstLayerRegion = regions.size();
 	}
 
-	// Tiles, as in bakeMesh().
+	else {
+		if(cfg.alphaMode == AlphaMode::Opaque) {
+			CutPaint clear;
+
+			clear.color = {0_cv, 0_cv, 0_cv, 0_cv};
+			regions.push_back({canvasRect, clear, false});
+		}
+
+		firstLayerRegion = regions.size();
+		addComposite(atlas, *composite, meta, stamps, W, W, false);
+	}
+
+	const bool haveAlpha = alphaMap && alphaMap->atlas && alphaMap->composite && alphaMap->width > 0_cv;
+
+	if(haveAlpha) {
+		// Alpha key em -> its px (x Wa) -> colour px (x W / Wa, y H / Ha).
+		const double wa = alphaMap->width, ha = alphaMap->height;
+		static const std::vector<LayerSource> noMeta;
+
+		addComposite(*alphaMap->atlas, *alphaMap->composite, alphaMap->meta ? *alphaMap->meta : noMeta, alphaMap->stamps, W, wa * H / ha, true);
+	}
+
+	for(const auto& r : regions) mesh.trianglesBefore += clipper::vertexCount(r.paths);
+
+	// LOD: every connected component (a layer's piece with its holes, a stamp instance) smaller
+	// than featurePx is folded - recorded at its centroid with its area and colour, and dropped from
+	// the geometry. Each face later takes the area-weighted mean of what was folded inside it,
+	// composited at the fold's own place in paint order (so a fold hidden under an opaque layer
+	// above it changes nothing).
+	struct Fold {
+		double x, y, area;
+		uint32_t region;
+		Color color;
+		bool used = false;
+	};
+
+	std::vector<Fold> folds;
+
+	mesh.featurePx = cfg.featurePx;
+
+	if(cfg.featurePx > 0_cv) {
+		const double fpx = cfg.featurePx;
+
+		for(size_t ri = firstLayerRegion; ri < regions.size(); ri++) {
+			Region& r = regions[ri];
+
+			if(r.paths.empty()) continue;
+
+			clipper::Paths keep;
+
+			for(const clipper::Paths& comp : clipper::components(r.paths)) {
+				const double A = std::abs(clipper::area(comp));
+				const double P = clipper::perimeter(comp.front());
+
+				if(P > 0 && 2.0 * A / P >= fpx) { keep.insert(keep.end(), comp.begin(), comp.end()); continue; }
+
+				double cx = 0, cy = 0;
+
+				clipper::centroid(comp.front(), cx, cy);
+
+				folds.push_back({cx, cy, A, uint32_t(ri), detail::paintColorAt(r.paint, cx, cy)});
+				mesh.foldedFeatures++;
+				mesh.foldedArea += A;
+			}
+
+			r.paths = std::move(keep);
+		}
+	}
+
+	// LOD outline simplification, after folding (a feature simplified away would vanish without
+	// leaving its colour in the mean).
+	if(cfg.simplifyPx > 0_cv) for(size_t ri = firstLayerRegion; ri < regions.size(); ri++) simplify(regions[ri].paths);
+
+	// Tiles over the window, as in bakeMesh().
 	auto boxOf = [](const clipper::Paths& paths) {
 		detail::Box b;
 
@@ -791,8 +1006,17 @@ inline BakedMesh bakeCutout(
 
 	for(const auto& r : regions) totalVerts += clipper::vertexCount(r.paths);
 
+	// Hopeless against the budget before any arrangement work: every outline vertex left after
+	// folding and simplification costs about a triangle, and planarization rarely hides more than
+	// most of them.
+	if(cfg.maxTriangles > 0 && totalVerts > cfg.maxTriangles * HOPELESS_VERTICES_PER_TRIANGLE) {
+		mesh.aborted = true;
+
+		return mesh;
+	}
+
 	const auto G = std::clamp<size_t>(static_cast<size_t>(std::ceil(std::sqrt(double(totalVerts) / double(PLANAR_TILE_VERTICES)))), 1, 32);
-	const double tw = double(cfg.width) / double(G), th = double(cfg.height) / double(G);
+	const double tw = (wx1 - wx0) / double(G), th = (wy1 - wy0) / double(G);
 
 	struct Face {
 		clipper::Paths paths;
@@ -812,10 +1036,21 @@ inline BakedMesh bakeCutout(
 		rprec[ri] = clipper::precisionFor(regions[ri].paths);
 	}
 
-	// One tile's arrangement: every region overlapping it, clipped to it, inserted in paint order.
+	std::vector<std::vector<uint32_t>> tileFolds(G * G);
+
+	for(uint32_t k = 0; k < folds.size(); k++) {
+		const auto i = size_t(std::clamp(int64_t(std::floor((folds[k].x - wx0) / tw)), int64_t(0), int64_t(G) - 1));
+		const auto j = size_t(std::clamp(int64_t(std::floor((folds[k].y - wy0) / th)), int64_t(0), int64_t(G) - 1));
+
+		tileFolds[j * G + i].push_back(k);
+	}
+
+	// One tile's arrangement: every region overlapping it, clipped to it, inserted in paint order
+	// (colour regions, then alpha-map regions; the two stacks composite separately).
 	auto buildTile = [&](size_t ti) {
 		const size_t i = ti % G, j = ti / G;
-		const double x0 = tw * double(i), y0 = th * double(j), x1 = tw * double(i + 1), y1 = th * double(j + 1);
+		const double x0 = wx0 + tw * double(i), y0 = wy0 + th * double(j);
+		const double x1 = i + 1 == G ? wx1 : wx0 + tw * double(i + 1), y1 = j + 1 == G ? wy1 : wy0 + th * double(j + 1);
 		const Clipper2Lib::RectD rect(x0, y0, x1, y1);
 		std::vector<Face> faces;
 
@@ -863,9 +1098,90 @@ inline BakedMesh bakeCutout(
 		return faces;
 	};
 
-	// Keep / drop faces.
-	const double test = cfg.alphaTest;
-	std::map<std::array<int64_t, 3>, uint16_t> solidIds;
+	const AlphaMode mode = cfg.alphaMode;
+	const double opacity = std::clamp(double(cfg.opacity), 0.0, 1.0);
+	const double test = mode == AlphaMode::AlphaTest ? double(cfg.alphaTest) : 1e-6;
+	const double cellPx = cfg.cellPx > 0_cv ? double(cfg.cellPx) : CUTOUT_CELL_PX;
+
+	// The face's final colour at a point (stack colours given).
+	auto finish = [&](const Premul& c, const Premul& a) {
+		Final f;
+
+		if(c.a > 0) { f.r = c.r / c.a; f.g = c.g / c.a; f.b = c.b / c.a; }
+
+		const double factor = haveAlpha ? (a.a > 0 ? std::clamp(a.g / a.a, 0.0, 1.0) : 0.0) : 1.0;
+
+		f.a = c.a * opacity * factor;
+
+		return f;
+	};
+
+	auto finalOf = [&](const std::vector<uint32_t>& stack, const std::vector<Color>& colors) {
+		Premul c, a;
+
+		for(size_t k = 0; k < stack.size(); k++) {
+			if(regions[stack[k]].alpha) a.over(colors[k]);
+			else c.over(colors[k]);
+		}
+
+		return finish(c, a);
+	};
+
+	// The stack with one folded feature inserted at its own paint position.
+	auto finalWith = [&](const std::vector<uint32_t>& stack, const std::vector<Color>& colors, uint32_t extra, const Color& extraColor) {
+		Premul c, a;
+		bool done = false;
+
+		for(size_t k = 0; k <= stack.size(); k++) {
+			if(!done && (k == stack.size() || stack[k] > extra)) {
+				(regions[extra].alpha ? a : c).over(extraColor);
+				done = true;
+			}
+
+			if(k < stack.size()) (regions[stack[k]].alpha ? a : c).over(colors[k]);
+		}
+
+		return finish(c, a);
+	};
+
+	// Area-weighted mean of the face (fractions fr) and the face with each fold: straight colour in
+	// Opaque mode (what it shows), premultiplied otherwise.
+	auto mixFolds = [&](const Final& base, const std::vector<Final>& withs, const std::vector<double>& fr) {
+		if(withs.empty()) return base;
+
+		Final out = base;
+
+		if(mode == AlphaMode::Opaque) {
+			for(size_t i = 0; i < withs.size(); i++) {
+				out.r += fr[i] * (withs[i].r - base.r);
+				out.g += fr[i] * (withs[i].g - base.g);
+				out.b += fr[i] * (withs[i].b - base.b);
+				out.a += fr[i] * (withs[i].a - base.a);
+			}
+
+			return out;
+		}
+
+		double pr = base.r * base.a, pg = base.g * base.a, pb = base.b * base.a, pa = base.a;
+
+		for(size_t i = 0; i < withs.size(); i++) {
+			pr += fr[i] * (withs[i].r * withs[i].a - base.r * base.a);
+			pg += fr[i] * (withs[i].g * withs[i].a - base.g * base.a);
+			pb += fr[i] * (withs[i].b * withs[i].a - base.b * base.a);
+			pa += fr[i] * (withs[i].a - base.a);
+		}
+
+		out.a = std::clamp(pa, 0.0, 1.0);
+
+		if(pa > 1e-9) { out.r = pr / pa; out.g = pg / pa; out.b = pb / pa; }
+
+		return out;
+	};
+
+	auto keeps = [&](double a) { return mode == AlphaMode::Opaque || (a >= test && a > 0); };
+	auto paintAlpha = [&](double a) { return mode == AlphaMode::Transparent ? std::clamp(a, 0.0, 1.0) : 1.0; };
+
+	std::map<std::array<int64_t, 4>, uint16_t> solidIds;
 	std::map<std::vector<int64_t>, uint16_t> rampIds;
 
 	struct Kept {
@@ -876,16 +1192,17 @@ inline BakedMesh bakeCutout(
 
 	std::vector<Kept> kept;
 
-	auto solidPaint = [&](double r, double g, double b) {
-		const std::array<int64_t, 3> k{std::llround(r * 65536), std::llround(g * 65536), std::llround(b * 65536)};
+	auto solidPaint = [&](const Final& f) {
+		const double pa = paintAlpha(f.a);
+		const std::array<int64_t, 4> k{std::llround(f.r * 65536), std::llround(f.g * 65536), std::llround(f.b * 65536), std::llround(pa * 65536)};
 		auto it = solidIds.find(k);
 
 		if(it != solidIds.end()) return it->second;
 
 		Paint p;
 
-		p.color = {slug_t(r), slug_t(g), slug_t(b), 1_cv};
-		p.opaque = true;
+		p.color = {slug_t(f.r), slug_t(f.g), slug_t(f.b), slug_t(pa)};
+		p.opaque = pa >= FINAL_OPAQUE_ALPHA;
 
 		const auto id = static_cast<uint16_t>(mesh.paints.size());
 
@@ -895,10 +1212,14 @@ inline BakedMesh bakeCutout(
 		return id;
 	};
 
+	auto pathsArea = [](const clipper::Paths& p) { return std::abs(clipper::area(p)); };
+
 	for(size_t ti = 0; ti < G * G; ti++) {
 		const std::vector<Face> faces = buildTile(ti);
 
-		for(const Face& f : faces) {
+		// One face (or one fold cell of a face): `fin` are the folds it takes, `frac` their share of its
+		// area.
+		auto processFace = [&](const Face& f, const std::vector<const Fold*>& fin, const std::vector<double>& frac) {
 			int gradientCount = 0;
 			int gradientAt = -1;
 
@@ -908,66 +1229,69 @@ inline BakedMesh bakeCutout(
 
 			const bool sweep = gradientAt >= 0 && regions[f.stack[size_t(gradientAt)]].paint.g->type == GradientInfo::Type::Sweep;
 
-			auto compositeAt2 = [&](double x, double y) {
-				Premul c;
+			std::vector<Color> colors(f.stack.size());
 
-				for(uint32_t ri : f.stack) c.over(detail::paintColorAt(regions[ri].paint, x, y));
+			std::vector<Final> withs(fin.size());
 
-				return c;
+			auto folded = [&](const Final& base) {
+				if(fin.empty()) return base;
+
+				for(size_t i = 0; i < fin.size(); i++) withs[i] = finalWith(f.stack, colors, fin[i]->region, fin[i]->color);
+
+				return mixFolds(base, withs, frac);
+			};
+
+			auto finalAt = [&](double x, double y) {
+				for(size_t k = 0; k < f.stack.size(); k++) colors[k] = detail::paintColorAt(regions[f.stack[k]].paint, x, y);
+
+				return folded(finalOf(f.stack, colors));
 			};
 
 			if(gradientCount == 0) {
-				const Premul c = compositeAt2((double(f.box.x0) + f.box.x1) * 0.5, (double(f.box.y0) + f.box.y1) * 0.5);
+				const Final c = finalAt((double(f.box.x0) + f.box.x1) * 0.5, (double(f.box.y0) + f.box.y1) * 0.5);
 
-				if(c.a >= test && c.a > 0) kept.push_back({f.paths, solidPaint(c.r / c.a, c.g / c.a, c.b / c.a), nullptr});
+				if(mode == AlphaMode::Opaque && c.a < FINAL_OPAQUE_ALPHA) mesh.transparentArea += pathsArea(f.paths);
 
-				continue;
+				if(keeps(c.a)) kept.push_back({f.paths, solidPaint(c), nullptr});
+
+				return;
 			}
 
 			if(gradientCount > 1 || sweep) {
-				// No closed form: subdivide into CUTOUT_CELL_PX cells, each kept / dropped at its center
-				// with its center color (the alphaTest edge is then within half a cell).
+				// No closed form: cellPx cells, each kept / dropped at its centre with its centre colour.
 				mesh.cutoutApproxFaces++;
 
 				const int precision = clipper::precisionFor(f.paths);
 
-				for(double y = std::floor(double(f.box.y0)); y < double(f.box.y1); y += CUTOUT_CELL_PX) {
-					for(double x = std::floor(double(f.box.x0)); x < double(f.box.x1); x += CUTOUT_CELL_PX) {
-						const Premul c = compositeAt2(x + CUTOUT_CELL_PX * 0.5, y + CUTOUT_CELL_PX * 0.5);
+				for(double y = std::floor(double(f.box.y0) / cellPx) * cellPx; y < double(f.box.y1); y += cellPx) {
+					for(double x = std::floor(double(f.box.x0) / cellPx) * cellPx; x < double(f.box.x1); x += cellPx) {
+						const Final c = finalAt(x + cellPx * 0.5, y + cellPx * 0.5);
+						const bool opaqueBad = mode == AlphaMode::Opaque && c.a < FINAL_OPAQUE_ALPHA;
 
-						if(!(c.a >= test && c.a > 0)) continue;
+						if(!keeps(c.a) && !opaqueBad) continue;
 
-						clipper::Paths cell = Clipper2Lib::RectClip(Clipper2Lib::RectD(x, y, x + CUTOUT_CELL_PX, y + CUTOUT_CELL_PX), f.paths, precision);
+						clipper::Paths cell = Clipper2Lib::RectClip(Clipper2Lib::RectD(x, y, x + cellPx, y + cellPx), f.paths, precision);
 
-						if(!cell.empty()) kept.push_back({std::move(cell), solidPaint(c.r / c.a, c.g / c.a, c.b / c.a), nullptr});
+						if(cell.empty()) continue;
+
+						if(opaqueBad) mesh.transparentArea += pathsArea(cell);
+
+						if(keeps(c.a)) kept.push_back({std::move(cell), solidPaint(c), nullptr});
 					}
 				}
 
-				continue;
+				return;
 			}
 
-			// One gradient: below (solids) / gradient / above (solids).
+			// One gradient (in either stack): every other region is solid.
 			const CutPaint& gp = regions[f.stack[size_t(gradientAt)]].paint;
-			Premul below, above;
 
-			for(int k = 0; k < gradientAt; k++) below.over(regions[f.stack[size_t(k)]].paint.color);
+			for(size_t k = 0; k < f.stack.size(); k++) colors[k] = regions[f.stack[k]].paint.color;
 
-			for(size_t k = size_t(gradientAt) + 1; k < f.stack.size(); k++) above.over(regions[f.stack[k]].paint.color);
+			auto finalAtT = [&](double t) {
+				colors[size_t(gradientAt)] = detail::paintColorAtT(gp, t);
 
-			auto compositeAt = [&](double t) {
-				Premul c = below;
-
-				c.over(detail::paintColorAtT(gp, t));
-
-				// above over c
-				const double aa = above.a;
-
-				c.r = above.r + c.r * (1 - aa);
-				c.g = above.g + c.g * (1 - aa);
-				c.b = above.b + c.b * (1 - aa);
-				c.a = aa + c.a * (1 - aa);
-
-				return c;
+				return folded(finalOf(f.stack, colors));
 			};
 
 			// Knots: 0, 1 and every stop (t is clamped to [0, 1]).
@@ -978,9 +1302,10 @@ inline BakedMesh bakeCutout(
 			std::sort(knots.begin(), knots.end());
 			knots.erase(std::unique(knots.begin(), knots.end()), knots.end());
 
-			// Kept t-intervals (alpha piecewise linear between knots).
+			// Kept t-intervals (final alpha piecewise linear between knots); Opaque keeps all.
 			std::vector<std::pair<double, double>> keep;
 			std::vector<double> samples(knots);
+			bool anyClear = false;
 
 			auto add = [&](double a, double b) {
 				if(!keep.empty() && std::abs(keep.back().second - a) < 1e-12) keep.back().second = b;
@@ -989,7 +1314,13 @@ inline BakedMesh bakeCutout(
 
 			for(size_t k = 0; k + 1 < knots.size(); k++) {
 				const double ta = knots[k], tb = knots[k + 1];
-				const double aa = compositeAt(ta).a - test, ab = compositeAt(tb).a - test;
+				const double fa = finalAtT(ta).a, fb = finalAtT(tb).a;
+
+				if(fa < FINAL_OPAQUE_ALPHA || fb < FINAL_OPAQUE_ALPHA) anyClear = true;
+
+				if(mode == AlphaMode::Opaque) { add(ta, tb); continue; }
+
+				const double aa = fa - test, ab = fb - test;
 
 				if(aa >= 0 && ab >= 0) add(ta, tb);
 
@@ -1003,7 +1334,11 @@ inline BakedMesh bakeCutout(
 				}
 			}
 
-			if(keep.empty()) continue;
+			// Opaque mode: the face is transparent at the end somewhere along its ramp. Its share of
+			// the area is not known in closed form; the face counts whole (an upper bound).
+			if(mode == AlphaMode::Opaque && anyClear) mesh.transparentArea += pathsArea(f.paths);
+
+			if(keep.empty()) return;
 
 			// Clamp semantics: an interval touching 0 / 1 extends to -inf / +inf.
 			for(auto& [a, b] : keep) {
@@ -1011,7 +1346,7 @@ inline BakedMesh bakeCutout(
 				if(b >= 1.0) b = std::numeric_limits<double>::infinity();
 			}
 
-			// Composite gradient paint: straight color at every knot and crossing.
+			// Composite gradient paint: the final colour at every knot and crossing.
 			std::sort(samples.begin(), samples.end());
 			samples.erase(std::unique(samples.begin(), samples.end()), samples.end());
 
@@ -1021,10 +1356,50 @@ inline BakedMesh bakeCutout(
 			paint.opaque = true;
 			paint.innerRadius = gp.g->innerRadius;
 
-			for(double t : samples) {
-				const Premul c = compositeAt(t);
+			// Between samples the ramp interpolates straight colour and alpha linearly, but the
+			// composite is not linear there once the gradient's alpha varies over other layers
+			// (products of the two). Refine each interval until the displayed colour (premultiplied
+			// for Transparent, straight otherwise) is within RAMP_TOLERANCE of the composite.
+			struct RampStop { double t; Final c; double pa; };
 
-				paint.stops.push_back({slug_t(t), c.a > 0 ? Color{slug_t(c.r / c.a), slug_t(c.g / c.a), slug_t(c.b / c.a), 1_cv} : Color{0_cv, 0_cv, 0_cv, 1_cv}});
+			auto stopAt = [&](double t) { const Final c = finalAtT(t); return RampStop{t, c, paintAlpha(c.a)}; };
+			auto shown = [&](const Final& c, double pa) {
+				return mode == AlphaMode::Transparent ? std::array<double, 4>{c.r * pa, c.g * pa, c.b * pa, pa} : std::array<double, 4>{c.r, c.g, c.b, 1.0};
+			};
+
+			std::vector<RampStop> ramp;
+
+			std::function<void(const RampStop&, const RampStop&, int)> refine = [&](const RampStop& a, const RampStop& b, int depth) {
+				if(depth < RAMP_MAX_DEPTH) {
+					const RampStop m = stopAt((a.t + b.t) * 0.5);
+					const Final lin{(a.c.r + b.c.r) * 0.5, (a.c.g + b.c.g) * 0.5, (a.c.b + b.c.b) * 0.5, 0.0};
+					const auto want = shown(m.c, m.pa), got = shown(lin, (a.pa + b.pa) * 0.5);
+					double err = 0;
+
+					for(int k = 0; k < 4; k++) err = std::max(err, std::abs(want[size_t(k)] - got[size_t(k)]));
+
+					if(err > RAMP_TOLERANCE) {
+						refine(a, m, depth + 1);
+						refine(m, b, depth + 1);
+
+						return;
+					}
+				}
+
+				ramp.push_back(b);
+			};
+
+			for(size_t k = 0; k < samples.size(); k++) {
+				const RampStop st = stopAt(samples[k]);
+
+				if(k == 0) ramp.push_back(st);
+				else refine(ramp.back(), st, 0);
+			}
+
+			for(const RampStop& st : ramp) {
+				paint.stops.push_back({slug_t(st.t), Color{slug_t(st.c.r), slug_t(st.c.g), slug_t(st.c.b), slug_t(st.pa)}});
+
+				if(st.pa < FINAL_OPAQUE_ALPHA) paint.opaque = false;
 			}
 
 			if(gp.g->type == GradientInfo::Type::Radial) {
@@ -1033,11 +1408,11 @@ inline BakedMesh bakeCutout(
 				paint.innerRadius = span != 0_cv ? gp.g->innerRadius / span : 0_cv;
 			}
 
-			// Identical composite ramps (same gradient under the same solids) share one paint.
+			// Identical composite ramps share one paint.
 			std::vector<int64_t> sig{int64_t(paint.type), std::llround(double(paint.innerRadius) * 65536)};
 
 			for(const auto& st : paint.stops) {
-				for(double v : {double(st.t), double(st.color.r), double(st.color.g), double(st.color.b)}) sig.push_back(std::llround(v * 65536));
+				for(double v : {double(st.t), double(st.color.r), double(st.color.g), double(st.color.b), double(st.color.a)}) sig.push_back(std::llround(v * 65536));
 			}
 
 			uint16_t paintId;
@@ -1098,7 +1473,7 @@ inline BakedMesh bakeCutout(
 				const double qy = b10 * (L.dx - cx) + b11 * (L.dy - cy);
 				const double det = q00 * q11 - q01 * q10;
 
-				if(std::abs(det) < 1e-18) continue;
+				if(std::abs(det) < 1e-18) return;
 
 				auto ellipse = [&](double r) {
 					clipper::Path poly;
@@ -1139,8 +1514,67 @@ inline BakedMesh bakeCutout(
 			}
 
 			if(!keepRegion.empty()) kept.push_back({std::move(keepRegion), paintId, &gp});
+		};
+
+		for(const Face& f0 : faces) {
+			// The folds whose centroid lies in this face, grouped by fold cells: each cell of the face
+			// that holds folds takes its own area-weighted mean, so the density of what was folded
+			// survives at the cell scale; the rest of the face is untouched. A cell is 2 x featurePx
+			// but never finer than 1/32 of the canvas: finer cells would cost more triangles (a piece
+			// and a hole each) than the features they replace.
+			std::map<std::pair<int64_t, int64_t>, std::vector<const Fold*>> cells;
+			const double cs = std::max({2.0 * double(cfg.featurePx), cellPx, std::max(W, H) / FOLD_GRID});
+
+			for(uint32_t k : tileFolds[ti]) {
+				Fold& fd = folds[k];
+
+				if(fd.used || fd.x < f0.box.x0 || fd.x > f0.box.x1 || fd.y < f0.box.y0 || fd.y > f0.box.y1) continue;
+				if(!clipper::contains(f0.paths, fd.x, fd.y)) continue;
+
+				fd.used = true;
+				cells[{int64_t(std::floor((fd.x - wx0) / cs)), int64_t(std::floor((fd.y - wy0) / cs))}].push_back(&fd);
+			}
+
+			if(cells.empty()) { processFace(f0, {}, {}); continue; }
+
+			const int precision = clipper::precisionFor(f0.paths);
+			clipper::Paths used;
+
+			for(const auto& [cell, list] : cells) {
+				const double x0 = wx0 + double(cell.first) * cs, y0 = wy0 + double(cell.second) * cs;
+				Face piece;
+
+				piece.paths = Clipper2Lib::RectClip(Clipper2Lib::RectD(x0, y0, x0 + cs, y0 + cs), f0.paths, precision);
+
+				if(piece.paths.empty()) continue;
+
+				piece.box = boxOf(piece.paths);
+				piece.stack = f0.stack;
+
+				const double A = pathsArea(piece.paths);
+				std::vector<double> fr;
+				double sum = 0;
+
+				for(const Fold* fd : list) { fr.push_back(A > 0 ? fd->area / A : 0.0); sum += fr.back(); }
+
+				if(sum > 1.0) for(double& v : fr) v /= sum;
+
+				processFace(piece, list, fr);
+				used.push_back({{x0, y0}, {x0 + cs, y0}, {x0 + cs, y0 + cs}, {x0, y0 + cs}});
+			}
+
+			Face rest;
+
+			rest.paths = clipper::difference(f0.paths, clipper::normalize(used, FillRule::NonZero));
+
+			if(rest.paths.empty()) continue;
+
+			rest.box = boxOf(rest.paths);
+			rest.stack = f0.stack;
+			processFace(rest, {}, {});
 		}
-		// Emit this tile's kept faces (everything opaque, no overlay), then drop them.
+
+		// Emit this tile's kept faces (no overlay), then drop them.
 		for(const Kept& k : kept) {
 			const tessellate::Mesh2D tri = detail::triangulateTiled(k.paths);
 			const auto base = static_cast<uint32_t>(mesh.positions.size() / 2);
@@ -1148,8 +1582,8 @@ inline BakedMesh bakeCutout(
 			for(size_t v = 0; v + 1 < tri.positions.size(); v += 2) {
 				const double x = tri.positions[v], y = tri.positions[v + 1];
 
-				mesh.positions.push_back(static_cast<float>(x / cfg.width));
-				mesh.positions.push_back(static_cast<float>(cfg.vUp ? 1.0 - y / cfg.height : y / cfg.height));
+				mesh.positions.push_back(static_cast<float>(x / W));
+				mesh.positions.push_back(static_cast<float>(cfg.vUp ? 1.0 - y / H : y / H));
 				mesh.paintIds.push_back(k.paint);
 
 				slug_t p0 = 0_cv, p1 = 0_cv;
@@ -1208,6 +1642,11 @@ inline BakedMesh bakeCutout(
 		}
 
 		kept.clear();
+
+		if(cfg.maxTriangles > 0 && mesh.indices.size() / 3 > cfg.maxTriangles) {
+			mesh.aborted = true;
+			break;
+		}
 	}
 
 	mesh.opaqueIndexCount = static_cast<uint32_t>(mesh.indices.size());
@@ -1215,6 +1654,130 @@ inline BakedMesh bakeCutout(
 	mesh.trianglesAfter = mesh.indices.size() / 3;
 
 	return mesh;
+}
+
+// ================================================================================================
+// LOD levels for bakeFinal(): level 0 is the key at its own tolerance with features below the
+// floor folded (the floor: what no view can resolve); each further level doubles the flattening
+// tolerance, the cell size and the folded feature size every two levels (half-octave steps). After
+// LOD_LEVELS levels comes the mean: the whole window in its area-weighted mean colour.
+// ================================================================================================
+struct LodLevel {
+	int level = 0;
+	slug_t tolerancePx = 0.25_cv;
+	slug_t featurePx = 0_cv;
+	slug_t cellPx = 1_cv;
+};
+
+inline constexpr int LOD_LEVELS = 15;
+
+// Half-octave steps: level L scales by k = 2^(L / 2) (1, 1.41, 2, 2.83, ... 128).
+inline LodLevel lodLevel(int level, slug_t baseTolerancePx, slug_t featureFloorPx=0_cv) {
+	LodLevel l;
+	const slug_t k = slug_t(std::exp2(0.5 * double(std::clamp(level, 0, 60))));
+
+	l.level = level;
+	l.tolerancePx = baseTolerancePx * k;
+	l.cellPx = slug_t(CUTOUT_CELL_PX) * k;
+	l.featurePx = level == 0 ? featureFloorPx : std::max(featureFloorPx, 0.5_cv * k);
+
+	return l;
+}
+
+inline void applyLod(BakeConfig& cfg, const LodLevel& l) {
+	cfg.tolerancePx = l.tolerancePx;
+	cfg.featurePx = l.featurePx;
+	cfg.cellPx = l.cellPx;
+	cfg.simplifyPx = l.level > 0 ? l.tolerancePx : 0_cv;
+}
+
+#ifdef SLUGHORN_HAS_MESHOPT
+// meshoptimizer on a bakeFinal() mesh (no overlay): welds identical vertices (position, paint,
+// parameter), then simplifies toward @p targetTriangles without passing @p maxErrorPx (authoring
+// px, absolute). Vertices that share a position but not a paint stay apart, so meshoptimizer sees
+// every colour boundary as an attribute seam and only ever slides along it: the boundaries stay
+// shared and exact, no gaps open between colours. Gradient parameters are linear in position, so
+// they stay exact on the new triangles. Returns the error meshoptimizer reports (px).
+inline double simplifyBaked(BakedMesh& m, double widthPx, double heightPx, size_t targetTriangles, double maxErrorPx, bool vUp=true) {
+	const size_t nv = m.positions.size() / 2;
+
+	if(m.indices.empty() || nv == 0) return 0.0;
+
+	struct Vtx { float u, v, paint, p0, p1; };
+
+	std::vector<Vtx> verts(nv);
+
+	for(size_t i = 0; i < nv; i++) verts[i] = {m.positions[i * 2], m.positions[i * 2 + 1], float(m.paintIds[i]), m.params[i * 2], m.params[i * 2 + 1]};
+
+	std::vector<unsigned int> remap(nv);
+	std::vector<unsigned int> idx(m.indices.begin(), m.indices.end());
+	const size_t unique = meshopt_generateVertexRemap(remap.data(), idx.data(), idx.size(), verts.data(), nv, sizeof(Vtx));
+
+	std::vector<Vtx> uv(unique);
+
+	meshopt_remapVertexBuffer(uv.data(), verts.data(), nv, sizeof(Vtx), remap.data());
+	meshopt_remapIndexBuffer(idx.data(), idx.data(), idx.size(), remap.data());
+
+	// Authoring-pixel positions (z = 0) so the error is in px.
+	std::vector<float> pos(unique * 3);
+
+	for(size_t i = 0; i < unique; i++) {
+		pos[i * 3] = float(double(uv[i].u) * widthPx);
+		pos[i * 3 + 1] = float((vUp ? 1.0 - double(uv[i].v) : double(uv[i].v)) * heightPx);
+		pos[i * 3 + 2] = 0.0f;
+	}
+
+	std::vector<unsigned int> out(idx.size());
+	float err = 0.0f;
+	const size_t n = meshopt_simplify(out.data(), idx.data(), idx.size(), pos.data(), unique, sizeof(float) * 3,
+		std::min(idx.size(), targetTriangles * 3), float(maxErrorPx), meshopt_SimplifyErrorAbsolute, &err);
+
+	out.resize(n);
+
+	// Compact the kept vertices.
+	std::vector<unsigned int> keep(unique, ~0u);
+	BakedMesh r = m;
+
+	r.positions.clear();
+	r.paintIds.clear();
+	r.params.clear();
+	r.indices.clear();
+
+	for(unsigned int i : out) {
+		if(keep[i] == ~0u) {
+			keep[i] = unsigned(r.positions.size() / 2);
+			r.positions.push_back(uv[i].u);
+			r.positions.push_back(uv[i].v);
+			r.paintIds.push_back(uint16_t(uv[i].paint));
+			r.params.push_back(uv[i].p0);
+			r.params.push_back(uv[i].p1);
+		}
+
+		r.indices.push_back(keep[i]);
+	}
+
+	r.opaqueIndexCount = uint32_t(r.indices.size());
+	r.overlayIndexCount = 0;
+	r.trianglesAfter = r.indices.size() / 3;
+	m = std::move(r);
+
+	return double(err);
+}
+#endif
+
+// The alpha-tested (cutout) bake: bakeFinal with AlphaMode::AlphaTest.
+inline BakedMesh bakeCutout(
+	const Atlas& atlas,
+	const CompositeShape& composite,
+	const std::vector<LayerSource>& meta,
+	const BakeConfig& cfg,
+	const stamp::Set* stamps=nullptr
+) {
+	BakeConfig c = cfg;
+
+	c.alphaMode = AlphaMode::AlphaTest;
+
+	return bakeFinal(atlas, &composite, meta, c, stamps);
 }
 
 

@@ -971,6 +971,9 @@ int main(int argc, char** argv) {
 	if(argc >= 3 && std::string(argv[1]) == "--stamp-compare") return stampCompareFiles(argc, argv);
 	if(argc >= 3 && std::string(argv[1]) == "--contact-sheet") return contactSheets(argc, argv);
 	if(argc >= 5 && std::string(argv[1]) == "--debug-key") return debugKey(argc, argv);
+	if(argc >= 4 && std::string(argv[1]) == "--alpha-bake") return alphaBakeSheet(argc, argv);
+	if(argc >= 3 && std::string(argv[1]) == "--lod-table") return lodTable(argc, argv);
+	if(argc >= 6 && std::string(argv[1]) == "--baseline-lod") return baselineLodSheet(argc, argv);
 #endif
 
 	if(argc >= 2) {
@@ -995,6 +998,7 @@ int main(int argc, char** argv) {
 	test_StampStrokeTolerance();
 	test_StampProtoExtent();
 	test_Cutout();
+	test_AlphaBake();
 #endif
 
 	std::cout

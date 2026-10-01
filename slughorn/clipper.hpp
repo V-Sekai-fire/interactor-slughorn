@@ -245,6 +245,94 @@ inline double area(const Paths& paths) {
 	return a;
 }
 
+// The connected components of a normalized region: each an outer ring followed by its holes
+// (islands inside holes are components of their own).
+inline std::vector<Paths> components(const Paths& region) {
+	std::vector<Paths> out;
+
+	if(region.empty()) return out;
+
+	Clipper2Lib::ClipperD c(precisionFor(region));
+
+	c.AddSubject(region);
+
+	Clipper2Lib::PolyTreeD tree;
+
+	c.Execute(Clipper2Lib::ClipType::Union, Clipper2Lib::FillRule::NonZero, tree);
+
+	std::vector<const Clipper2Lib::PolyPathD*> todo;
+
+	for(const auto& outer : tree) todo.push_back(outer.get());
+
+	while(!todo.empty()) {
+		const Clipper2Lib::PolyPathD* outer = todo.back();
+
+		todo.pop_back();
+
+		Paths comp{outer->Polygon()};
+
+		for(const auto& hole : *outer) {
+			comp.push_back(hole->Polygon());
+
+			for(const auto& island : *hole) todo.push_back(island.get());
+		}
+
+		out.push_back(std::move(comp));
+	}
+
+	return out;
+}
+
+inline double perimeter(const Path& p) {
+	double l = 0.0;
+
+	for(size_t i = 0; i < p.size(); i++) {
+		const auto& a = p[i];
+		const auto& b = p[(i + 1) % p.size()];
+
+		l += std::hypot(b.x - a.x, b.y - a.y);
+	}
+
+	return l;
+}
+
+// Area centroid of one ring (its vertex mean when degenerate).
+inline void centroid(const Path& p, double& cx, double& cy) {
+	double a = 0.0, x = 0.0, y = 0.0;
+
+	for(size_t i = 0; i < p.size(); i++) {
+		const auto& u = p[i];
+		const auto& v = p[(i + 1) % p.size()];
+		const double w = u.x * v.y - v.x * u.y;
+
+		a += w;
+		x += (u.x + v.x) * w;
+		y += (u.y + v.y) * w;
+	}
+
+	if(std::abs(a) > 1e-12) { cx = x / (3.0 * a); cy = y / (3.0 * a); return; }
+
+	cx = cy = 0.0;
+
+	for(const auto& u : p) { cx += u.x; cy += u.y; }
+
+	if(!p.empty()) { cx /= double(p.size()); cy /= double(p.size()); }
+}
+
+// Nonzero containment of a point in a normalized region (outer rings positive, holes negative).
+inline bool contains(const Paths& region, double x, double y) {
+	int winding = 0;
+	const Clipper2Lib::PointD pt(x, y);
+
+	for(const auto& p : region) {
+		if(Clipper2Lib::PointInPolygon(pt, p) == Clipper2Lib::PointInPolygonResult::IsOutside) continue;
+
+		winding += Clipper2Lib::Area(p) > 0 ? 1 : -1;
+	}
+
+	return winding > 0;
+}
+
 inline size_t vertexCount(const Paths& paths) {
 	size_t n = 0;
 

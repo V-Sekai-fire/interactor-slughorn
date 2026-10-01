@@ -301,9 +301,15 @@ static std::vector<std::string> write(const std::string& dir, const std::string&
 
 	const auto labelH = uint32_t(4 + 20 * lines);
 
+	// Wide enough for the longest label line (12 px a character at scale 2).
+	size_t longest = 0;
+
+	for(const Row& row : rows) for(const auto& t : row.text) longest = std::max(longest, t.size());
+	for(const auto& h : headers) longest = std::max(longest, h.size());
+
 	for(size_t first = 0, n = 1; first < rows.size(); first += perSheet, n++) {
 		const size_t count = std::min<size_t>(perSheet, rows.size() - first);
-		Canvas cv(uint32_t(pad + columns * (cell + pad)), uint32_t(headH + count * (labelH + cell + pad)));
+		Canvas cv(uint32_t(std::max<size_t>(pad + columns * (cell + pad), 2 * pad + 12 * longest)), uint32_t(headH + count * (labelH + cell + pad)));
 
 		for(size_t c = 0; c < headers.size(); c++) cv.text(int64_t(pad + c * (cell + pad)), 8, headers[c], 2, 255, 220, 120);
 
@@ -942,4 +948,482 @@ int debugKey(int argc, char** argv) {
 	}
 
 	return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Alpha folded into the bake (bake::bakeFinal): only the FINAL composite is judged, as three.js
+// shades the material.
+// ------------------------------------------------------------------------------------------------
+static slughorn::bake::AlphaSource alphaSourceOf(KeyRun& r) {
+	slughorn::bake::AlphaSource a;
+
+	a.atlas = &r.sc.atlas;
+	a.composite = &r.merged.composite;
+	a.meta = &r.merged.layers;
+	a.stamps = &r.sc.set;
+	a.width = r.sc.cfg.width;
+	a.height = r.sc.cfg.height;
+
+	return a;
+}
+
+// A key's CPU decode stretched over a w x h raster (its whole canvas; premultiplied).
+static std::vector<slug_t> decodeOver(KeyRun& r, uint32_t w, uint32_t h) {
+	return slughorn::stamp::renderComposite(r.sc.atlas, r.merged.composite, r.sc.set, w, h, 0_cv, 0_cv, 1_cv, r.sc.cfg.heightEm).data;
+}
+
+// three.js's formula, point-sampled S x S a pixel and box-averaged to W x H: rgb = the colour
+// key's straight composite (white without a colour key; 0 where its alpha is 0, as WebGL
+// un-premultiplies a canvas texture), a = its alpha x opacity x the alpha-map key's straight green.
+// Opaque shows (rgb, 1), Transparent (rgb a, a), AlphaTest (rgb, 1) where a >= test.
+static std::vector<slug_t> threeFormula(const std::vector<slug_t>* colourHi, const std::vector<slug_t>* alphaHi, uint32_t W, uint32_t H, uint32_t S,
+		double opacity, slughorn::bake::AlphaMode mode, double test) {
+	using slughorn::bake::AlphaMode;
+
+	std::vector<slug_t> out(size_t(W) * H * 4, 0_cv);
+
+	for(uint32_t y = 0; y < H * S; y++) for(uint32_t x = 0; x < W * S; x++) {
+		const size_t i = (size_t(y) * W * S + x) * 4;
+		double r = 1, g = 1, b = 1, a = 1;
+
+		if(colourHi) {
+			const slug_t* c = &(*colourHi)[i];
+
+			a = c[3];
+			r = a > 0 ? c[0] / a : 0.0; g = a > 0 ? c[1] / a : 0.0; b = a > 0 ? c[2] / a : 0.0;
+		}
+
+		double A = a * opacity;
+
+		if(alphaHi) {
+			const slug_t* m = &(*alphaHi)[i];
+
+			A *= m[3] > 0 ? std::clamp(double(m[1]) / double(m[3]), 0.0, 1.0) : 0.0;
+		}
+
+		double o[4] = {0, 0, 0, 0};
+
+		if(mode == AlphaMode::Opaque) { o[0] = r; o[1] = g; o[2] = b; o[3] = 1; }
+		else if(mode == AlphaMode::Transparent) { o[0] = r * A; o[1] = g * A; o[2] = b * A; o[3] = A; }
+		else if(A >= test && A > 0) { o[0] = r; o[1] = g; o[2] = b; o[3] = 1; }
+
+		const size_t q = (size_t(y / S) * W + x / S) * 4;
+
+		for(int k = 0; k < 4; k++) out[q + size_t(k)] += slug_t(o[k] / double(S * S));
+	}
+
+	return out;
+}
+
+struct AlphaCase {
+	std::string name;
+	std::string colourSvg; // "" = no colour key (white)
+	std::string alphaSvg;  // "" = no alpha map
+	double opacity = 1.0;
+	slughorn::bake::AlphaMode mode = slughorn::bake::AlphaMode::Transparent;
+	double alphaTest = 0.0;
+	bool ignoreAlphaMap = false; // negative control: bake as if there were no alpha map
+};
+
+struct AlphaResult {
+	Diff d;
+	slughorn::bake::BakedMesh mesh;
+	std::vector<slug_t> ref, img;
+	uint32_t W = 0, H = 0;
+	bool ok = false;
+};
+
+static AlphaResult runAlphaCase(const AlphaCase& c, uint32_t W=256, uint32_t S=4) {
+	AlphaResult res;
+	KeyRun colour, alpha;
+
+	if(!c.colourSvg.empty()) runKey(c.colourSvg, colour, W);
+	if(!c.alphaSvg.empty()) runKey(c.alphaSvg, alpha, W);
+
+	KeyRun* frame = !c.colourSvg.empty() ? &colour : &alpha;
+
+	if(!frame->ok) return res;
+
+	const uint32_t H = frame->H;
+
+	slughorn::bake::BakeConfig bc;
+
+	bc.width = frame->sc.cfg.width;
+	bc.height = frame->sc.cfg.height;
+	bc.vUp = true;
+	bc.alphaMode = c.mode;
+	bc.alphaTest = slug_t(c.alphaTest);
+	bc.opacity = slug_t(c.opacity);
+
+	const slughorn::bake::AlphaSource as = c.alphaSvg.empty() ? slughorn::bake::AlphaSource{} : alphaSourceOf(alpha);
+	const bool withAlpha = !c.alphaSvg.empty() && !c.ignoreAlphaMap;
+
+	res.mesh = slughorn::bake::bakeFinal(frame->sc.atlas, c.colourSvg.empty() ? nullptr : &colour.merged.composite,
+		colour.merged.layers, bc, c.colourSvg.empty() ? nullptr : &colour.sc.set, withAlpha ? &as : nullptr);
+
+	const std::vector<slug_t> colourHi = c.colourSvg.empty() ? std::vector<slug_t>{} : decodeOver(colour, W * S, H * S);
+	const std::vector<slug_t> alphaHi = c.alphaSvg.empty() ? std::vector<slug_t>{} : decodeOver(alpha, W * S, H * S);
+
+	res.ref = threeFormula(c.colourSvg.empty() ? nullptr : &colourHi, c.alphaSvg.empty() ? nullptr : &alphaHi, W, H, S, c.opacity, c.mode, c.alphaTest);
+	res.img = rasterizeMesh(res.mesh, W, H, true, int(S));
+	res.d = compare(res.img, res.ref);
+	res.W = W;
+	res.H = H;
+	res.ok = true;
+
+	return res;
+}
+
+// Parity of a bake with the formula: the edges of a vector bake against a 4 x 4 point-sampled
+// reference leave a little noise, nothing else.
+static bool alphaParity(const Diff& d) {
+	return d.mean < 0.01 && d.bad < 0.005;
+}
+
+static const std::string SVG_OPAQUE_STACK = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+<defs><linearGradient id="g" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="128" y2="0"><stop offset="0" stop-color="#ff0000" stop-opacity="0.2"/><stop offset="1" stop-color="#0000ff" stop-opacity="0.7"/></linearGradient></defs>
+<rect width="128" height="128" fill="#e8e0d0"/>
+<circle cx="48" cy="56" r="36" fill="#208040" fill-opacity="0.5"/>
+<rect x="40" y="40" width="80" height="50" fill="url(#g)"/>
+<path d="M10 120 L64 70 L118 120Z" fill="#202060" fill-opacity="0.35"/>
+</svg>)SVG";
+
+static const std::string SVG_OPAQUE_HOLE = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+<rect x="8" y="8" width="112" height="70" fill="#e8e0d0"/>
+<circle cx="64" cy="90" r="30" fill="#c04060" fill-opacity="0.6"/>
+</svg>)SVG";
+
+static const std::string SVG_TRANSPARENT = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+<defs>
+<linearGradient id="l" gradientUnits="userSpaceOnUse" x1="10" y1="0" x2="118" y2="0"><stop offset="0" stop-color="#ff8000" stop-opacity="0"/><stop offset="0.5" stop-color="#ffff00" stop-opacity="0.9"/><stop offset="1" stop-color="#00a0ff" stop-opacity="0.3"/></linearGradient>
+<radialGradient id="r" gradientUnits="userSpaceOnUse" cx="90" cy="90" r="34"><stop offset="0" stop-color="#ffffff" stop-opacity="1"/><stop offset="1" stop-color="#4000ff" stop-opacity="0"/></radialGradient>
+</defs>
+<rect x="10" y="10" width="108" height="40" fill="url(#l)"/>
+<circle cx="40" cy="80" r="30" fill="#30a060" fill-opacity="0.45"/>
+<rect x="56" y="56" width="68" height="68" fill="url(#r)"/>
+<rect x="20" y="30" width="60" height="70" fill="url(#l)" fill-opacity="0.8"/>
+</svg>)SVG";
+
+static std::vector<AlphaCase> alphaCases(const std::string& mossSvg) {
+	using slughorn::bake::AlphaMode;
+
+	std::vector<AlphaCase> cs;
+
+	if(!mossSvg.empty()) {
+		cs.push_back({"plaza tree moss: no map, alphaMap plaza-moss, opacity 0.85, transparent", "", mossSvg, 0.85, AlphaMode::Transparent, 0.0});
+		cs.push_back({"CONTROL moss with the alpha map ignored (must fail)", "", mossSvg, 0.85, AlphaMode::Transparent, 0.0, true});
+		cs.push_back({"moss as a cutout: alphaMap plaza-moss, opacity 0.85, alphaTest 0.5", "", mossSvg, 0.85, AlphaMode::AlphaTest, 0.5});
+	}
+
+	cs.push_back({"opaque material, stack ends opaque (translucent layers inside)", SVG_OPAQUE_STACK, "", 1.0, AlphaMode::Opaque, 0.0});
+	cs.push_back({"opaque material, transparent at the end (reported, black)", SVG_OPAQUE_HOLE, "", 1.0, AlphaMode::Opaque, 0.0});
+	cs.push_back({"transparent material: alpha = composite (gradients, overlaps)", SVG_TRANSPARENT, "", 1.0, AlphaMode::Transparent, 0.0});
+	cs.push_back({"transparent material, opacity 0.6", SVG_TRANSPARENT, "", 0.6, AlphaMode::Transparent, 0.0});
+
+	if(!mossSvg.empty()) {
+		cs.push_back({"colour key + alphaMap plaza-moss, transparent", SVG_TRANSPARENT, mossSvg, 0.85, AlphaMode::Transparent, 0.0});
+	}
+
+	return cs;
+}
+
+static std::string alphaModeName(slughorn::bake::AlphaMode m) {
+	return m == slughorn::bake::AlphaMode::Opaque ? "OPAQUE" : m == slughorn::bake::AlphaMode::Transparent ? "TRANSPARENT" : "ALPHA_TEST";
+}
+
+static std::string readFileText(const std::string& path) {
+	std::ifstream in(path, std::ios::binary);
+	std::stringstream ss;
+
+	ss << in.rdbuf();
+
+	return ss.str();
+}
+
+// Unit test: the synthetic cases always; the moss case when SLUG_MOSS_SVG names plaza-moss.svg.
+void test_AlphaBake() {
+	std::cout << "\n=== test_AlphaBake ===" << std::endl;
+
+	const char* moss = std::getenv("SLUG_MOSS_SVG");
+
+	for(const AlphaCase& c : alphaCases(moss ? readFileText(moss) : std::string())) {
+		const AlphaResult r = runAlphaCase(c);
+		const bool control = c.ignoreAlphaMap;
+
+		std::cout << "  " << c.name << ": mean|d|=" << r.d.mean << " bad=" << r.d.bad * 100 << "% max|d|=" << r.d.maxd
+			<< " tris=" << r.mesh.trianglesAfter << " transparentArea=" << r.mesh.transparentArea << "/" << r.mesh.canvasArea << std::endl;
+
+		if(control) check(("negative control fails: " + c.name).c_str(), r.ok && !alphaParity(r.d));
+		else check(("bake == three.js formula: " + c.name).c_str(), r.ok && alphaParity(r.d));
+
+		if(c.mode == slughorn::bake::AlphaMode::Opaque) {
+			const bool hole = c.colourSvg == SVG_OPAQUE_HOLE;
+
+			check(("opaque bake: every paint opaque: " + c.name).c_str(), std::all_of(r.mesh.paints.begin(), r.mesh.paints.end(), [](const auto& p) { return p.opaque; }));
+
+			if(hole) check("transparent at the end is reported (area > 0)", r.mesh.transparentArea > 100.0);
+			else check("an opaque stack reports no transparency", r.mesh.transparentArea == 0.0);
+		}
+	}
+}
+
+// --alpha-bake OUT_DIR plaza-moss.svg: the cases on a sheet (three.js formula | bake | diff x4).
+int alphaBakeSheet(int argc, char** argv) {
+	const std::string dir = argv[2];
+	std::vector<sheet::Row> rows;
+	int failures = 0;
+
+	for(const AlphaCase& c : alphaCases(readFileText(argv[3]))) {
+		const AlphaResult r = runAlphaCase(c);
+		const bool pass = c.ignoreAlphaMap ? !alphaParity(r.d) : alphaParity(r.d);
+
+		failures += !pass;
+
+		std::cout << (pass ? "ok   " : "FAIL ") << c.name << ": mean|d|=" << r.d.mean << " bad=" << r.d.bad * 100 << "% max|d|=" << r.d.maxd
+			<< " tris=" << r.mesh.trianglesAfter << " transparentArea=" << r.mesh.transparentArea << std::endl;
+
+		sheet::Row row;
+
+		row.text = {
+			c.name,
+			alphaModeName(c.mode) + "  OPACITY " + sheet::fmt(c.opacity, 2) + (c.alphaTest > 0 ? "  ALPHATEST " + sheet::fmt(c.alphaTest, 2) : "") +
+				"  MEAN|D| " + sheet::fmt(r.d.mean) + "  BAD " + sheet::fmt(r.d.bad * 100, 2) + "%  " + (pass ? (c.ignoreAlphaMap ? "CONTROL CAUGHT" : "PASS") : "FAIL"),
+			"TRIS " + std::to_string(r.mesh.trianglesAfter) + (c.mode == slughorn::bake::AlphaMode::Opaque ?
+				"  TRANSPARENT AT END " + sheet::fmt(r.mesh.canvasArea > 0 ? 100.0 * r.mesh.transparentArea / r.mesh.canvasArea : 0.0, 2) + "% OF THE CANVAS" : ""),
+		};
+		row.cols = {r.ref, r.img, sheet::absDiff(r.ref, r.img)};
+		row.gains = {1.0, 1.0, 4.0};
+		row.w = r.W;
+		row.h = r.H;
+		rows.push_back(std::move(row));
+	}
+
+	for(const auto& p : sheet::write(dir, "alpha-bake", rows, {"THREE.JS", "SLUG-BAKED", "DIFF X4"})) std::cout << "sheet: " << p << std::endl;
+
+	return failures ? 1 : 0;
+}
+
+// --lod-table <svg...>: per key, every LOD level of the final bake (Opaque; AlphaTest 0.5 for card
+// keys) with its triangles, folds, time, and its error against three.js's formula on the key.
+int lodTable(int argc, char** argv) {
+	using slughorn::bake::AlphaMode;
+
+	const uint32_t W = 256, S = 4;
+
+	std::cout << "key,card,level,tolerance_px,feature_px,triangles,folded,folded_area,ms,err_mean,err_bad,aborted" << std::endl;
+
+	for(int i = 2; i < argc; i++) {
+		const std::string svg = readFileText(argv[i]);
+		const std::string key = std::filesystem::path(argv[i]).stem().string();
+		KeyRun r;
+
+		runKey(svg, r, W);
+
+		if(!r.ok) continue;
+
+		size_t clear = 0;
+
+		for(size_t p = 0; p < size_t(W) * r.H; p++) clear += r.decode[p * 4 + 3] < 0.5_cv;
+
+		const bool card = double(clear) / (double(W) * r.H) > 0.05;
+		const AlphaMode mode = card ? AlphaMode::AlphaTest : AlphaMode::Opaque;
+		const auto hi = decodeOver(r, W * S, r.H * S);
+		const auto ref = threeFormula(&hi, nullptr, W, r.H, S, 1.0, mode, 0.5);
+
+		for(int level = 0; level < slughorn::bake::LOD_LEVELS; level++) {
+			slughorn::bake::BakeConfig bc;
+
+			bc.width = r.sc.cfg.width;
+			bc.height = r.sc.cfg.height;
+			bc.vUp = true;
+			bc.alphaMode = mode;
+			bc.alphaTest = 0.5_cv;
+			bc.maxTriangles = std::getenv("SLUG_LOD_MAXTRI") ? size_t(std::atol(std::getenv("SLUG_LOD_MAXTRI"))) : 400000;
+			slughorn::bake::applyLod(bc, slughorn::bake::lodLevel(level, 0.25_cv));
+
+			const auto t0 = std::chrono::steady_clock::now();
+			const auto mesh = slughorn::bake::bakeFinal(r.sc.atlas, &r.merged.composite, r.merged.layers, bc, &r.sc.set);
+			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+			const Diff d = mesh.aborted ? Diff{1, 1, 0, 1} : compare(rasterizeMesh(mesh, W, r.H, true, int(S)), ref);
+
+			std::cout << key << "," << card << "," << level << "," << bc.tolerancePx << "," << bc.featurePx << "," << mesh.trianglesAfter << ","
+				<< mesh.foldedFeatures << "," << mesh.foldedArea << "," << ms << "," << d.mean << "," << d.bad << "," << mesh.aborted << std::endl;
+		}
+	}
+
+	return 0;
+}
+
+// --baseline-lod OUT_DIR ORACLE_RAW_DIR CAP <svg...>: slug-baked baseline per key (a full-canvas
+// surface with a CAP-triangle budget; cards alpha-tested at 0.5, the rest opaque), at the finest
+// LOD within the budget exactly as slug.elf's slug::bake() picks it (level by level, meshoptimizer
+// when within 2x of the cap), against the oracle - the real canvas the original draws
+// (ORACLE_RAW_DIR/<key>.rgba: uint32 width, height, then straight RGBA8 rows, top first).
+// Sheet: oracle (three.js's formula on it) | the baseline mesh | |diff| x4, worst first.
+static bool readRaw(const std::string& path, uint32_t& w, uint32_t& h, std::vector<uint8_t>& px) {
+	std::ifstream in(path, std::ios::binary);
+
+	if(!in) return false;
+
+	in.read(reinterpret_cast<char*>(&w), 4);
+	in.read(reinterpret_cast<char*>(&h), 4);
+
+	if(!in || w == 0 || h == 0 || w > 16384 || h > 16384) return false;
+
+	px.resize(size_t(w) * h * 4);
+	in.read(reinterpret_cast<char*>(px.data()), std::streamsize(px.size()));
+
+	return bool(in);
+}
+
+// The oracle canvas under three.js's formula for the bake's mode, point-sampled (nearest texel)
+// S x S a pixel of W x H and box-averaged - the same sampling the mesh gets.
+static std::vector<slug_t> oracleFormula(uint32_t ow, uint32_t oh, const std::vector<uint8_t>& px, uint32_t W, uint32_t H,
+		slughorn::bake::AlphaMode mode, double test, uint32_t S=4) {
+	using slughorn::bake::AlphaMode;
+
+	std::vector<slug_t> out(size_t(W) * H * 4, 0_cv);
+
+	for(uint32_t y = 0; y < H * S; y++) for(uint32_t x = 0; x < W * S; x++) {
+		const auto ox = uint32_t(std::min<double>(ow - 1, std::floor((x + 0.5) / (W * S) * ow)));
+		const auto oy = uint32_t(std::min<double>(oh - 1, std::floor((y + 0.5) / (H * S) * oh)));
+		const uint8_t* p = &px[(size_t(oy) * ow + ox) * 4];
+		const double a = p[3] / 255.0;
+		const double r = a > 0 ? p[0] / 255.0 : 0.0, g = a > 0 ? p[1] / 255.0 : 0.0, b = a > 0 ? p[2] / 255.0 : 0.0;
+		double o[4] = {0, 0, 0, 0};
+
+		if(mode == AlphaMode::Opaque) { o[0] = r; o[1] = g; o[2] = b; o[3] = 1; }
+		else if(mode == AlphaMode::Transparent) { o[0] = r * a; o[1] = g * a; o[2] = b * a; o[3] = a; }
+		else if(a >= test && a > 0) { o[0] = r; o[1] = g; o[2] = b; o[3] = 1; }
+
+		const size_t q = (size_t(y / S) * W + x / S) * 4;
+
+		for(int k = 0; k < 4; k++) out[q + size_t(k)] += slug_t(o[k] / double(S * S));
+	}
+
+	return out;
+}
+
+struct BaselinePick {
+	slughorn::bake::BakedMesh mesh;
+	int level = -1;
+	slughorn::bake::LodLevel lod;
+	double simplifyErr = 0;
+	std::vector<std::string> ladder;
+};
+
+static double baselineReach() { return std::getenv("SLUG_REACH") ? std::atof(std::getenv("SLUG_REACH")) : 8.0; }
+
+// slug::bake()'s level walk on a full canvas.
+static BaselinePick pickBaseline(KeyRun& r, slughorn::bake::AlphaMode mode, size_t cap) {
+	BaselinePick out;
+
+	for(int level = 0; level < slughorn::bake::LOD_LEVELS; level++) {
+		slughorn::bake::BakeConfig bc;
+
+		bc.width = r.sc.cfg.width;
+		bc.height = r.sc.cfg.height;
+		bc.vUp = true;
+		bc.alphaMode = mode;
+		bc.alphaTest = 0.5_cv;
+		bc.maxTriangles = cap * 8;
+
+		const auto lod = slughorn::bake::lodLevel(level, 0.25_cv);
+
+		slughorn::bake::applyLod(bc, lod);
+
+		auto m = slughorn::bake::bakeFinal(r.sc.atlas, &r.merged.composite, r.merged.layers, bc, &r.sc.set);
+
+		out.ladder.push_back("L" + std::to_string(level) + ":" + (m.aborted ? std::string("ABORT") : std::to_string(m.trianglesAfter)));
+
+		if(!m.aborted && m.trianglesAfter <= cap) { out.mesh = std::move(m); out.level = level; out.lod = lod; return out; }
+
+#ifdef SLUGHORN_HAS_MESHOPT
+		if(!m.aborted && double(m.trianglesAfter) <= baselineReach() * double(cap)) {
+			out.simplifyErr = slughorn::bake::simplifyBaked(m, r.sc.cfg.width, r.sc.cfg.height, cap, slughorn::bake::lodLevel(level + 1, 0.25_cv).tolerancePx);
+
+			if(m.trianglesAfter <= cap) { out.ladder.back() += ">MESHOPT " + std::to_string(m.trianglesAfter); out.mesh = std::move(m); out.level = level; out.lod = lod; return out; }
+		}
+#endif
+	}
+
+	return out;
+}
+
+int baselineLodSheet(int argc, char** argv) {
+	using slughorn::bake::AlphaMode;
+
+	const std::string dir = argv[2];
+	const std::string oracleDir = argv[3];
+	const auto cap = size_t(std::atol(argv[4]));
+	const uint32_t W = 256, S = 4;
+	std::vector<sheet::Row> rows;
+	int failures = 0;
+
+	std::cout << "key,mode,level,triangles,feature_px,tolerance_px,simplify_err,err_mean,err_bad,direct_err_mean,direct_err_bad,ladder" << std::endl;
+
+	for(int i = 5; i < argc; i++) {
+		const std::string svg = readFileText(argv[i]);
+		const std::string key = std::filesystem::path(argv[i]).stem().string();
+		KeyRun r;
+
+		runKey(svg, r, W);
+
+		if(!r.ok) continue;
+
+		const uint32_t H = r.H;
+		size_t clear = 0;
+
+		for(size_t p = 0; p < size_t(W) * H; p++) clear += r.decode[p * 4 + 3] < 0.5_cv;
+
+		const bool card = double(clear) / (double(W) * H) > 0.05;
+		const AlphaMode mode = card ? AlphaMode::AlphaTest : AlphaMode::Opaque;
+		const BaselinePick pick = pickBaseline(r, mode, cap);
+		const bool within = pick.level >= 0 && pick.mesh.trianglesAfter <= cap;
+
+		failures += !within;
+
+		uint32_t ow = 0, oh = 0;
+		std::vector<uint8_t> px;
+		const bool haveOracle = readRaw(oracleDir + "/" + key + ".rgba", ow, oh, px);
+		const auto img = rasterizeMesh(pick.mesh, W, H, true, int(S));
+
+		// Without an oracle image the reference is slug's own formula on the key (labelled).
+		const auto hi = decodeOver(r, W * S, H * S);
+		const auto own = threeFormula(&hi, nullptr, W, H, S, 1.0, mode, 0.5);
+		const auto ref = haveOracle ? oracleFormula(ow, oh, px, W, H, mode, 0.5) : own;
+		const Diff d = compare(img, ref);
+		const Diff dOwn = haveOracle ? compare(own, ref) : Diff{};
+
+		std::string ladder;
+
+		for(const auto& s : pick.ladder) ladder += (ladder.empty() ? "" : " ") + s;
+
+		std::cout << key << "," << (card ? "alpha_test" : "opaque") << "," << pick.level << "," << pick.mesh.trianglesAfter << "," << pick.lod.featurePx << ","
+			<< pick.lod.tolerancePx << "," << pick.simplifyErr << "," << d.mean << "," << d.bad << "," << dOwn.mean << "," << dOwn.bad << "," << ladder << std::endl;
+
+		sheet::Row row;
+
+		row.text = {
+			key + (card ? "  CARD ALPHA_TEST .5" : "  OPAQUE") + "  LOD " + std::to_string(pick.level) + "  TRIS " + std::to_string(pick.mesh.trianglesAfter) + " / " +
+				std::to_string(cap) + (within ? "" : "  OVER BUDGET"),
+			"KEEPS FEATURES >= " + sheet::fmt(pick.lod.featurePx, 1) + " PX  TOLERANCE " + sheet::fmt(pick.lod.tolerancePx, 2) + " PX" +
+				(pick.simplifyErr > 0 ? "  MESHOPT ERR " + sheet::fmt(pick.simplifyErr, 2) + " PX" : ""),
+			std::string(haveOracle ? "VS ORACLE " : "VS SLUG FORMULA (NO ORACLE) ") + sheet::fmt(d.mean) + "/" + sheet::fmt(d.bad * 100, 2) + "%" +
+				(haveOracle ? "   SLUG DIRECT VS ORACLE " + sheet::fmt(dOwn.mean) + "/" + sheet::fmt(dOwn.bad * 100, 2) + "%" : ""),
+			"LADDER " + ladder,
+		};
+		row.cols = {ref, img, sheet::absDiff(ref, img)};
+		row.gains = {1.0, 1.0, 4.0};
+		row.w = W;
+		row.h = H;
+		row.err = d.mean;
+		rows.push_back(std::move(row));
+	}
+
+	std::stable_sort(rows.begin(), rows.end(), [](const sheet::Row& a, const sheet::Row& b) { return a.err > b.err; });
+
+	for(const auto& p : sheet::write(dir, "baseline-lod", rows, {"ORACLE", "SLUG-BAKED", "DIFF X4"})) std::cout << "sheet: " << p << std::endl;
+
+	return failures ? 1 : 0;
 }

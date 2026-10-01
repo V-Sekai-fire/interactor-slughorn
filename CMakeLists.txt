@@ -46,6 +46,8 @@ option(SLUGHORN_NANOSVG "Include NanoSVG support (requires nanosvg)" OFF)
 option(SLUGHORN_THORVG "Include ThorVG SVG support (builds vendored ext/thorvg: SVG loader + sw engine)" OFF)
 option(SLUGHORN_THORVG_THREADS "Build ThorVG with its task-scheduler threads (THORVG_THREAD_SUPPORT)" OFF)
 option(SLUGHORN_CLIPPER2 "Include Clipper2 polygon booleans (clip paths, fill-rule normalization, planarization)" OFF)
+option(SLUGHORN_MESHOPT "Include meshoptimizer (bake LOD: simplify baked meshes to a triangle budget)" OFF)
+set(SLUGHORN_MESHOPTIMIZER_DIR "" CACHE PATH "A meshoptimizer checkout (with src/meshoptimizer.h); default ext/meshoptimizer")
 option(SLUGHORN_FREETYPE "Include FreeType support (requires freetype2)" OFF)
 option(SLUGHORN_SDF "Include SDF/MSDF tile baking (requires msdfgen)" OFF)
 option(SLUGHORN_TESSELLATE "Include polygon triangulation/extrusion support (requires earcut.hpp)" OFF)
@@ -164,6 +166,33 @@ if(SLUGHORN_CLIPPER2)
 
 	target_compile_definitions(slughorn PUBLIC SLUGHORN_HAS_CLIPPER2)
 	target_link_libraries(slughorn PUBLIC slughorn_clipper2)
+endif()
+
+# https://github.com/zeux/meshoptimizer - the bake's LOD simplification (bake.hpp simplifyBaked). Not
+# vendored: point SLUGHORN_MESHOPTIMIZER_DIR at a checkout (the workspace keeps one at
+# 2-contract/meshoptimizer), or clone it to ext/meshoptimizer. Only the simplifier and the index
+# generator are compiled.
+if(SLUGHORN_MESHOPT)
+	set(_slughorn_meshopt_dir "${SLUGHORN_MESHOPTIMIZER_DIR}")
+
+	if(_slughorn_meshopt_dir STREQUAL "")
+		set(_slughorn_meshopt_dir "${CMAKE_CURRENT_SOURCE_DIR}/ext/meshoptimizer")
+	endif()
+
+	if(NOT EXISTS "${_slughorn_meshopt_dir}/src/meshoptimizer.h")
+		message(FATAL_ERROR "SLUGHORN_MESHOPT: no meshoptimizer at '${_slughorn_meshopt_dir}' (set SLUGHORN_MESHOPTIMIZER_DIR)")
+	endif()
+
+	add_library(slughorn_meshopt STATIC
+		"${_slughorn_meshopt_dir}/src/simplifier.cpp"
+		"${_slughorn_meshopt_dir}/src/indexgenerator.cpp"
+		"${_slughorn_meshopt_dir}/src/allocator.cpp"
+	)
+	target_include_directories(slughorn_meshopt SYSTEM PUBLIC "${_slughorn_meshopt_dir}/src")
+	set_target_properties(slughorn_meshopt PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+	target_compile_definitions(slughorn PUBLIC SLUGHORN_HAS_MESHOPT)
+	target_link_libraries(slughorn PUBLIC slughorn_meshopt)
 endif()
 
 # https://github.com/thorvg/thorvg (vendored as ext/thorvg, pinned v1.0.3 - the version Godot's
