@@ -22,7 +22,8 @@
 // slughorn.CurveDecomposer (owns its Curves internally - safe for Python GC)
 //
 // slughorn.render / slughorn.canvas / slughorn.emoji (always present)
-// slughorn.freetype / slughorn.nanosvg / slughorn.tessellate (present per SLUGHORN_HAS_* build)
+// slughorn.freetype / slughorn.nanosvg / slughorn.thorvg / slughorn.tessellate / slughorn.bake
+// (present per SLUGHORN_HAS_* build)
 //
 // SCOPING NOTE
 // ------------
@@ -102,6 +103,29 @@ PYBIND11_MODULE(slughorn, m) {
 	);
 
 	slughorn_python::bind_nanosvg(m_nanosvg);
+#endif
+
+#ifdef SLUGHORN_HAS_THORVG
+	auto m_thorvg = m.def_submodule("thorvg",
+		"ThorVG backend - parse SVG files or strings with ThorVG (the vector library Godot\n"
+		"embeds) into Atlas shapes.\n\n"
+		"Produces a CompositeShape with one Layer per painted ThorVG shape (fill, then stroke),\n"
+		"back-to-front order preserved; LoadConfig.layers reports per-layer provenance.\n\n"
+		"Both functions accept an optional KeyIterator that is advanced in-place "
+		"as shapes are registered. Pass the same KeyIterator across multiple calls "
+		"to pack several SVGs into one atlas without key collisions."
+	);
+
+	slughorn_python::bind_thorvg(m_thorvg);
+#endif
+
+#if defined(SLUGHORN_HAS_TESSELLATE) && defined(SLUGHORN_HAS_CLIPPER2)
+	auto m_bake = m.def_submodule("bake",
+		"Layer merging, planar mesh baking (Slug contours -> one non-overlapping triangle set\n"
+		"plus an alpha overlay range) and per-key cost records. See slughorn/bake.hpp."
+	);
+
+	slughorn_python::bind_bake(m_bake);
 #endif
 
 #ifdef SLUGHORN_HAS_TESSELLATE

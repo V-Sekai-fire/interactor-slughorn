@@ -950,6 +950,18 @@ public:
 
 	bool hasPendingPath() const { return !_pendingCurves.empty() || !_activeCurves.empty(); }
 
+	// Copy of every curve this path currently holds (pending curves followed by any still-open
+	// active subpath), in the same order mergedContourStarts() indexes. Lets backends that only
+	// borrow Path for its geometry verbs (e.g. strokePath() stroke-to-fill expansion in
+	// slughorn/thorvg.hpp) read the result back without committing through a Canvas.
+	Atlas::Curves curves() const {
+		Atlas::Curves out = _pendingCurves;
+
+		out.insert(out.end(), _activeCurves.begin(), _activeCurves.end());
+
+		return out;
+	}
+
 	// Resolved subpath-start list for _pendingCurves (index 0 explicit, unlike the internal
 	// _pendingSubpathStarts storage convention) - what strokePath()/getShapeContours() actually
 	// want to consume. Empty return means "no curves, or boundaries are unknown" (see

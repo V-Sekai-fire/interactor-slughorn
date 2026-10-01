@@ -14,8 +14,8 @@ license = "MIT"
 Repository = "https://github.com/AlphaPixel/slughorn"
 
 [tool.scikit-build]
-# Every optional feature here is vendored as a git submodule (pybind11, nanosvg, json, earcut,
-# msdfgen) except FreeType, which is a normal system/vcpkg dependency -- see CIBW_BEFORE_ALL /
+# Every optional feature here is vendored as a git submodule (pybind11, nanosvg, thorvg, clipper2,
+# json, earcut, msdfgen) except FreeType, which is a normal system/vcpkg dependency -- see CIBW_BEFORE_ALL /
 # vcpkg install steps in .github/workflows/wheels.yml. MSDF is built MSDFGEN_CORE_ONLY (see this
 # repo's own CMakeLists.txt), which skips msdfgen's PNG-requiring `msdfgen-ext` target entirely
 # (ext/msdfgen/CMakeLists.txt: `if(NOT MSDFGEN_CORE_ONLY)` gates `find_package(PNG REQUIRED)`),
@@ -25,6 +25,8 @@ Repository = "https://github.com/AlphaPixel/slughorn"
 cmake.args = [
 	"-DSLUGHORN_SERIAL=ON",
 	"-DSLUGHORN_NANOSVG=ON",
+	"-DSLUGHORN_THORVG=ON",
+	"-DSLUGHORN_CLIPPER2=ON",
 	"-DSLUGHORN_FREETYPE=ON",
 	"-DSLUGHORN_TESSELLATE=ON",
 	"-DSLUGHORN_SDF=ON",

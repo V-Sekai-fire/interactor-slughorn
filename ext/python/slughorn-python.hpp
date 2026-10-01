@@ -254,4 +254,12 @@ void bind_nanosvg(py::module_& m_nanosvg);
 void bind_tessellate(py::module_& m_tessellate);
 #endif
 
+#ifdef SLUGHORN_HAS_THORVG
+void bind_thorvg(py::module_& m_thorvg);
+#endif
+
+#if defined(SLUGHORN_HAS_TESSELLATE) && defined(SLUGHORN_HAS_CLIPPER2)
+void bind_bake(py::module_& m_bake);
+#endif
+
 }

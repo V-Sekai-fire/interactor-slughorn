@@ -353,6 +353,13 @@ void bind_core(py::module_& m) {
 		.value("Mask", slughorn::DrawMode::Mask)
 	;
 
+	py::enum_<slughorn::FillRule>(m, "FillRule",
+		"Authoring-time fill rule of a source path (SVG fill-rule). The Slug shader is nonzero-only;\n"
+		"loaders convert even-odd and report the original rule alongside each layer.")
+		.value("NonZero", slughorn::FillRule::NonZero)
+		.value("EvenOdd", slughorn::FillRule::EvenOdd)
+	;
+
 	py::enum_<slughorn::BlendMode>(m, "BlendMode")
 		.value("SrcOver", slughorn::BlendMode::SrcOver)
 		.value("Src", slughorn::BlendMode::Src)

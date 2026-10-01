@@ -552,6 +552,20 @@ enum class BlendMode: uint8_t {
 };
 
 // ================================================================================================
+// FillRule
+//
+// Authoring-time fill rule of a source path (SVG fill-rule / clip-rule). The Slug coverage shader
+// itself is nonzero-only: backends that load even-odd content convert it to an equivalent nonzero
+// winding on the CPU (see nanosvg.hpp / thorvg.hpp). The original rule is still worth carrying
+// alongside a Layer for consumers that re-derive regions from the curves (e.g. polygon boolean
+// normalization before tessellation, slughorn/clipper.hpp), since even-odd is winding-agnostic.
+// ================================================================================================
+enum class FillRule: uint8_t {
+	NonZero = 0,
+	EvenOdd = 1,
+};
+
+// ================================================================================================
 // Mask
 //
 // Per-layer mask specification. Exactly one of two sources drives shape coverage:

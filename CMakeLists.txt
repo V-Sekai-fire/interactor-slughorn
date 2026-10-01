@@ -42,6 +42,9 @@ endif()
 
 option(SLUGHORN_SERIAL "Include serialization support (requires nlohmann)" OFF)
 option(SLUGHORN_NANOSVG "Include NanoSVG support (requires nanosvg)" OFF)
+option(SLUGHORN_THORVG "Include ThorVG SVG support (builds vendored ext/thorvg: SVG loader + sw engine)" OFF)
+option(SLUGHORN_THORVG_THREADS "Build ThorVG with its task-scheduler threads (THORVG_THREAD_SUPPORT)" OFF)
+option(SLUGHORN_CLIPPER2 "Include Clipper2 polygon booleans (clip paths, fill-rule normalization, planarization)" OFF)
 option(SLUGHORN_FREETYPE "Include FreeType support (requires freetype2)" OFF)
 option(SLUGHORN_SDF "Include SDF/MSDF tile baking (requires msdfgen)" OFF)
 option(SLUGHORN_TESSELLATE "Include polygon triangulation/extrusion support (requires earcut.hpp)" OFF)
@@ -130,6 +133,144 @@ if(SLUGHORN_NANOSVG)
 		SYSTEM PUBLIC
 			$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/ext/nanosvg/src>
 	)
+endif()
+
+# https://github.com/AngusJohnson/Clipper2 (vendored as ext/clipper2, pinned Clipper2_1.5.4).
+# Compiled as its own static library so slughorn's strict warning flags don't apply to it.
+if(SLUGHORN_CLIPPER2)
+	if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ext/clipper2/CPP/Clipper2Lib")
+		message(FATAL_ERROR
+			"ext/clipper2 not found. Run:
+"
+			"  git submodule update --init --recursive"
+		)
+	endif()
+
+	set(_slughorn_clipper2_dir "${CMAKE_CURRENT_SOURCE_DIR}/ext/clipper2/CPP/Clipper2Lib")
+
+	add_library(slughorn_clipper2 STATIC
+		"${_slughorn_clipper2_dir}/src/clipper.engine.cpp"
+		"${_slughorn_clipper2_dir}/src/clipper.offset.cpp"
+		"${_slughorn_clipper2_dir}/src/clipper.rectclip.cpp"
+	)
+	target_include_directories(slughorn_clipper2 SYSTEM PUBLIC "${_slughorn_clipper2_dir}/include")
+	target_compile_features(slughorn_clipper2 PUBLIC cxx_std_17)
+	set_target_properties(slughorn_clipper2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+	target_compile_definitions(slughorn PUBLIC SLUGHORN_HAS_CLIPPER2)
+	target_link_libraries(slughorn PUBLIC slughorn_clipper2)
+endif()
+
+# https://github.com/thorvg/thorvg (vendored as ext/thorvg, pinned v1.0.3 - the version Godot's
+# thirdparty/thorvg ships). ThorVG's own build is meson; like Godot (modules/svg/SCsub) we compile
+# the subset we need directly: common + renderer + sw_engine + the SVG and raw loaders. No PNG/JPG/
+# WebP loaders (embedded raster <image>s are skipped by slughorn/thorvg.hpp anyway), no Lottie,
+# no TTF, no GL/WG engines. config.h is generated into the build tree.
+if(SLUGHORN_THORVG)
+	if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ext/thorvg/inc/thorvg.h")
+		message(FATAL_ERROR
+			"ext/thorvg not found. Run:
+"
+			"  git submodule update --init --recursive"
+		)
+	endif()
+
+	set(_slughorn_tvg "${CMAKE_CURRENT_SOURCE_DIR}/ext/thorvg")
+	set(_slughorn_tvg_config "${CMAKE_CURRENT_BINARY_DIR}/thorvg-config")
+
+	set(_slughorn_tvg_threads "")
+	if(SLUGHORN_THORVG_THREADS)
+		set(_slughorn_tvg_threads "#define THORVG_THREAD_SUPPORT")
+	endif()
+
+	file(WRITE "${_slughorn_tvg_config}/config.h.in"
+		"#ifndef THORVG_CONFIG_H
+"
+		"#define THORVG_CONFIG_H
+"
+		"#define THORVG_SW_RASTER_SUPPORT
+"
+		"#define THORVG_SVG_LOADER_SUPPORT
+"
+		"#define THORVG_FILE_IO_SUPPORT
+"
+		"${_slughorn_tvg_threads}
+"
+		"#define THORVG_VERSION_STRING \"1.0.3\"
+"
+		"#endif
+"
+	)
+	configure_file("${_slughorn_tvg_config}/config.h.in" "${_slughorn_tvg_config}/config.h" COPYONLY)
+
+	add_library(slughorn_thorvg STATIC
+		# common
+		"${_slughorn_tvg}/src/common/tvgColor.cpp"
+		"${_slughorn_tvg}/src/common/tvgCompressor.cpp"
+		"${_slughorn_tvg}/src/common/tvgMath.cpp"
+		"${_slughorn_tvg}/src/common/tvgStr.cpp"
+		# SVG parser
+		"${_slughorn_tvg}/src/loaders/svg/tvgSvgCssStyle.cpp"
+		"${_slughorn_tvg}/src/loaders/svg/tvgSvgLoader.cpp"
+		"${_slughorn_tvg}/src/loaders/svg/tvgSvgPath.cpp"
+		"${_slughorn_tvg}/src/loaders/svg/tvgSvgSceneBuilder.cpp"
+		"${_slughorn_tvg}/src/loaders/svg/tvgSvgUtil.cpp"
+		"${_slughorn_tvg}/src/loaders/svg/tvgXmlParser.cpp"
+		"${_slughorn_tvg}/src/loaders/raw/tvgRawLoader.cpp"
+		# renderer common
+		"${_slughorn_tvg}/src/renderer/tvgAccessor.cpp"
+		"${_slughorn_tvg}/src/renderer/tvgCanvas.cpp"
+		"${_slughorn_tvg}/src/renderer/tvgFill.cpp"
+		"${_slughorn_tvg}/src/renderer/tvgInitializer.cpp"
+		"${_slughorn_tvg}/src/renderer/tvgLoader.cpp"
+		"${_slughorn_tvg}/src/renderer/tvgPaint.cpp"
+		"${_slughorn_tvg}/src/renderer/tvgPicture.cpp"
+		"${_slughorn_tvg}/src/renderer/tvgRender.cpp"
+		"${_slughorn_tvg}/src/renderer/tvgScene.cpp"
+		"${_slughorn_tvg}/src/renderer/tvgShape.cpp"
+		"${_slughorn_tvg}/src/renderer/tvgTaskScheduler.cpp"
+		"${_slughorn_tvg}/src/renderer/tvgText.cpp"
+		# renderer sw_engine
+		"${_slughorn_tvg}/src/renderer/sw_engine/tvgSwFill.cpp"
+		"${_slughorn_tvg}/src/renderer/sw_engine/tvgSwImage.cpp"
+		"${_slughorn_tvg}/src/renderer/sw_engine/tvgSwMath.cpp"
+		"${_slughorn_tvg}/src/renderer/sw_engine/tvgSwMemPool.cpp"
+		"${_slughorn_tvg}/src/renderer/sw_engine/tvgSwPostEffect.cpp"
+		"${_slughorn_tvg}/src/renderer/sw_engine/tvgSwRaster.cpp"
+		"${_slughorn_tvg}/src/renderer/sw_engine/tvgSwRenderer.cpp"
+		"${_slughorn_tvg}/src/renderer/sw_engine/tvgSwRle.cpp"
+		"${_slughorn_tvg}/src/renderer/sw_engine/tvgSwShape.cpp"
+		"${_slughorn_tvg}/src/renderer/sw_engine/tvgSwStroke.cpp"
+	)
+	target_include_directories(slughorn_thorvg
+		SYSTEM PUBLIC
+			"${_slughorn_tvg}/inc"
+		PRIVATE
+			"${_slughorn_tvg_config}"
+			"${_slughorn_tvg}/src/common"
+			"${_slughorn_tvg}/src/renderer"
+			"${_slughorn_tvg}/src/renderer/sw_engine"
+			"${_slughorn_tvg}/src/loaders/svg"
+			"${_slughorn_tvg}/src/loaders/raw"
+	)
+	target_compile_definitions(slughorn_thorvg PUBLIC TVG_STATIC)
+	target_compile_features(slughorn_thorvg PUBLIC cxx_std_14)
+	set_target_properties(slughorn_thorvg PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+	if(MSVC)
+		target_compile_options(slughorn_thorvg PRIVATE /W0 /wd4996 /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX)
+	else()
+		target_compile_options(slughorn_thorvg PRIVATE -w)
+	endif()
+
+	if(SLUGHORN_THORVG_THREADS)
+		find_package(Threads REQUIRED)
+		target_link_libraries(slughorn_thorvg PUBLIC Threads::Threads)
+	endif()
+
+	target_compile_definitions(slughorn PRIVATE SLUGHORN_THORVG_IMPLEMENTATION)
+	target_compile_definitions(slughorn PUBLIC SLUGHORN_HAS_THORVG)
+	target_link_libraries(slughorn PUBLIC slughorn_thorvg)
 endif()
 
 if(SLUGHORN_FREETYPE)
@@ -294,6 +435,14 @@ if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
 		target_sources(slughorn_python_bindings PRIVATE "ext/python/slughorn-tessellate.cpp")
 	endif()
 
+	if(SLUGHORN_THORVG)
+		target_sources(slughorn_python_bindings PRIVATE "ext/python/slughorn-thorvg.cpp")
+	endif()
+
+	if(SLUGHORN_TESSELLATE AND SLUGHORN_CLIPPER2)
+		target_sources(slughorn_python_bindings PRIVATE "ext/python/slughorn-bake.cpp")
+	endif()
+
 	pybind11_add_module(slughorn_python "ext/python/slughorn.cpp")
 
 	set_target_properties(slughorn_python PROPERTIES
@@ -335,10 +484,13 @@ option(SLUGHORN_BUILD_TESTS "Compile testing files" OFF)
 if(SLUGHORN_BUILD_TESTS)
 	enable_testing()
 
-	find_package(PkgConfig REQUIRED)
+	# pkg-config is only used to locate Cairo (optional); Windows/MSVC hosts usually lack it.
+	find_package(PkgConfig QUIET)
 
 	# Cairo (optional)
-	pkg_check_modules(CAIRO IMPORTED_TARGET cairo)
+	if(PKG_CONFIG_FOUND)
+		pkg_check_modules(CAIRO IMPORTED_TARGET cairo)
+	endif()
 
 	if(CAIRO_FOUND)
 		add_executable(slughorn-test-cairo "test/slughorn-test-cairo.cpp")
@@ -372,6 +524,18 @@ if(SLUGHORN_BUILD_TESTS)
 		message(STATUS "slughorn tests: NanoSVG enabled, building slughorn-test-nanosvg")
 	else()
 		message(STATUS "slughorn tests: SLUGHORN_NANOSVG=OFF, skipping slughorn-test-nanosvg")
+	endif()
+
+	# ThorVG (optional - requires SLUGHORN_THORVG=ON and SLUGHORN_SERIAL=ON; uses NanoSVG,
+	# Clipper2 and Tessellate for the parity / mis-winding / bake checks when they are enabled)
+	if(SLUGHORN_THORVG AND SLUGHORN_SERIAL)
+		add_executable(slughorn-test-thorvg "test/slughorn-test-thorvg.cpp")
+		target_link_libraries(slughorn-test-thorvg PRIVATE slughorn)
+		target_compile_options(slughorn-test-thorvg PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/bigobj>)
+		add_test(NAME thorvg COMMAND slughorn-test-thorvg)
+		message(STATUS "slughorn tests: ThorVG enabled, building slughorn-test-thorvg")
+	else()
+		message(STATUS "slughorn tests: SLUGHORN_THORVG=OFF (or SERIAL=OFF), skipping slughorn-test-thorvg")
 	endif()
 
 	# Tessellate (optional - requires SLUGHORN_TESSELLATE=ON)

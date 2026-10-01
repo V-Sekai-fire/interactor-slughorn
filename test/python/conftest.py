@@ -84,3 +84,15 @@ def requires_tessellate():
 		not hasattr(slughorn, "tessellate"),
 		reason="slughorn.tessellate not compiled in (SLUGHORN_TESSELLATE)",
 	)
+
+def requires_thorvg():
+	return pytest.mark.skipif(
+		not hasattr(slughorn, "thorvg"),
+		reason="slughorn.thorvg not compiled in (SLUGHORN_THORVG)",
+	)
+
+def requires_bake():
+	return pytest.mark.skipif(
+		not hasattr(slughorn, "bake"),
+		reason="slughorn.bake not compiled in (SLUGHORN_TESSELLATE + SLUGHORN_CLIPPER2)",
+	)
