@@ -627,11 +627,14 @@ public:
 
 			// Pass 2a: per-segment perpendicular normals (left-hand: +90 deg from travel direction).
 			std::vector<std::pair<slug_t, slug_t>> segN(numSegs);
+			std::vector<slug_t> segLen(numSegs);
 
 			for(size_t i = 0; i < numSegs; i++) {
 				const slug_t dx = pts[i + 1].first - pts[i].first;
 				const slug_t dy = pts[i + 1].second - pts[i].second;
 				const slug_t len = std::sqrt(dx * dx + dy * dy);
+
+				segLen[i] = len;
 
 				segN[i] = len > 1e-9_cv
 					? std::pair{-dy / len, dx / len}
@@ -686,7 +689,20 @@ public:
 					;
 
 					if(c.kind == CornerKind::Miter) { c.innerNx = bx * m; c.innerNy = by * m; }
-					else { c.innerNx = bx; c.innerNy = by; } // unit bisector, no miter scaling
+
+					else {
+						// The inner wall's corner is where the two inner offset lines meet (m along
+						// the bisector, whatever the join; the join only shapes the OUTER side).
+						// That point slides h * sqrt(m^2 - 1) along each segment, so cap it to the
+						// shorter neighbour: past that a very sharp corner keeps the old (shorter)
+						// point. A unit bisector everywhere pulled the inner wall in toward the
+						// centreline and left an uncovered sliver along both inner edges.
+						const slug_t lmin = std::min(segLen[prev], segLen[cur]);
+						const slug_t mcap = h > 0_cv ? std::sqrt(1_cv + (lmin / h) * (lmin / h)) : 1_cv;
+						const slug_t mi = std::max(1_cv, std::min(m, mcap));
+
+						c.innerNx = bx * mi; c.innerNy = by * mi;
+					}
 				}
 
 				// Near-180-degree reversal: bisector degenerates, no real corner to bevel/round --

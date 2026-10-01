@@ -67,7 +67,32 @@ struct Proto {
 	Atlas::Curves curves = {};
 	std::vector<size_t> starts = {};
 	Key key = Key(0u);
+
+	// Extent in the unit frame (fitExtent()): [0, 1]^2 for Rect, [-1, 1]^2 for Ellipse, the
+	// control-point hull's box for Curve - which may leave the unit square (stroke overhang, round
+	// caps), so instance bounds must come from here, never from the unit square.
+	slug_t x0 = 0_cv, y0 = 0_cv, x1 = 1_cv, y1 = 1_cv;
 };
+
+// Sets @p p's unit-frame extent from its kind / curves.
+inline void fitExtent(Proto& p) {
+	if(p.kind == Kind::Ellipse) { p.x0 = p.y0 = -1_cv; p.x1 = p.y1 = 1_cv; return; }
+
+	p.x0 = p.y0 = 0_cv;
+	p.x1 = p.y1 = 1_cv;
+
+	if(p.kind != Kind::Curve || p.curves.empty()) return;
+
+	p.x0 = p.y0 = std::numeric_limits<slug_t>::max();
+	p.x1 = p.y1 = std::numeric_limits<slug_t>::lowest();
+
+	for(const auto& c : p.curves) {
+		for(const auto& [x, y] : {std::pair<slug_t, slug_t>{c.x1, c.y1}, {c.x2, c.y2}, {c.x3, c.y3}}) {
+			p.x0 = std::min(p.x0, x); p.y0 = std::min(p.y0, y);
+			p.x1 = std::max(p.x1, x); p.y1 = std::max(p.y1, y);
+		}
+	}
+}
 
 struct Instance {
 	Matrix m = {};        // unit frame -> canvas em
@@ -121,6 +146,8 @@ inline void registerProtos(Set& set, Atlas& atlas, const std::string& prefix) {
 	for(size_t i = 0; i < set.protos.size(); i++) {
 		Proto& p = set.protos[i];
 
+		fitExtent(p);
+
 		if(p.kind != Kind::Curve || p.curves.empty()) continue;
 
 		p.key = Key(prefix + "p_" + std::to_string(i));
@@ -142,10 +169,12 @@ struct Box {
 	slug_t x0, y0, x1, y1;
 };
 
-inline Box bounds(const Instance& in, Kind kind) {
+// Canvas-em box of an instance of @p proto: the image of the prototype's unit-frame extent (exact
+// for the unit circle).
+inline Box bounds(const Instance& in, const Proto& proto) {
 	const Matrix& m = in.m;
 
-	if(kind == Kind::Ellipse) {
+	if(proto.kind == Kind::Ellipse) {
 		const slug_t hx = std::hypot(m.xx, m.xy);
 		const slug_t hy = std::hypot(m.yx, m.yy);
 
@@ -155,7 +184,7 @@ inline Box bounds(const Instance& in, Kind kind) {
 	Box b{std::numeric_limits<slug_t>::max(), std::numeric_limits<slug_t>::max(),
 		std::numeric_limits<slug_t>::lowest(), std::numeric_limits<slug_t>::lowest()};
 
-	for(const auto& [ux, uy] : {std::pair{0_cv, 0_cv}, {1_cv, 0_cv}, {0_cv, 1_cv}, {1_cv, 1_cv}}) {
+	for(const auto& [ux, uy] : {std::pair{proto.x0, proto.y0}, {proto.x1, proto.y0}, {proto.x0, proto.y1}, {proto.x1, proto.y1}}) {
 		slug_t x, y;
 
 		m.apply(ux, uy, x, y);
@@ -165,6 +194,12 @@ inline Box bounds(const Instance& in, Kind kind) {
 	}
 
 	return b;
+}
+
+inline Box bounds(const Instance& in, const Set& set) {
+	static const Proto unit{};
+
+	return bounds(in, in.proto < set.protos.size() ? set.protos[in.proto] : unit);
 }
 
 struct Inverse {
@@ -344,7 +379,7 @@ inline void renderStampLayer(render::Image& img, Evaluator& ev, const Set& set, 
 	for(const Instance& in : layer.instances) {
 		if(in.proto >= set.protos.size() || in.color.a <= 0_cv) continue;
 
-		const Box b = bounds(in, set.protos[in.proto].kind);
+		const Box b = bounds(in, set.protos[in.proto]);
 		const Inverse inv = invert(in.m);
 
 		const auto i0 = std::max<int64_t>(0, int64_t(std::floor((b.x0 - win.emX0) * ppeX)) - 1);
@@ -451,8 +486,7 @@ inline Grid buildGrid(
 	const double pad = pxPerEm > 0_cv ? 1.0 / double(pxPerEm) : 0.0;
 
 	for(const Instance& in : layer.instances) {
-		const Kind k = in.proto < set.protos.size() ? set.protos[in.proto].kind : Kind::Rect;
-		const Box b = bounds(in, k);
+		const Box b = bounds(in, set);
 
 		boxes.push_back({
 			(double(b.x0) - pad) / canvasEmW,
@@ -504,7 +538,7 @@ inline Grid buildGrid(
 		const auto [j0, j1] = range(b.v0, b.v1, g.G);
 
 		const Instance& in = layer.instances[n];
-		const Box eb = bounds(in, in.proto < set.protos.size() ? set.protos[in.proto].kind : Kind::Rect);
+		const Box eb = bounds(in, set);
 		const float side = float(std::max(eb.x1 - eb.x0, eb.y1 - eb.y0));
 
 		for(uint32_t j = j0; j <= j1; j++) for(uint32_t i = i0; i <= i1; i++) {
@@ -671,7 +705,7 @@ inline uint32_t splitDeep(Set& set, CompositeShape& composite, slug_t canvasEmW,
 		for(Instance& in : layer.instances) {
 			cells.clear();
 
-			const Box b = bounds(in, in.proto < set.protos.size() ? set.protos[in.proto].kind : Kind::Rect);
+			const Box b = bounds(in, set);
 			const double u0 = (double(b.x0) - pad) / canvasEmW, u1 = (double(b.x1) + pad) / canvasEmW;
 			const double v0 = 1.0 - (double(b.y1) + pad) / canvasEmH, v1 = 1.0 - (double(b.y0) - pad) / canvasEmH;
 
@@ -809,7 +843,7 @@ inline size_t wrapDuplicates(Set& set, slug_t canvasEmW, slug_t canvasEmH, slug_
 		for(const Instance& in : layer.instances) {
 			out.push_back(in);
 
-			const Box b = bounds(in, in.proto < set.protos.size() ? set.protos[in.proto].kind : Kind::Rect);
+			const Box b = bounds(in, set);
 
 			for(int sy = -1; sy <= 1; sy++) {
 				for(int sx = -1; sx <= 1; sx++) {
@@ -1131,6 +1165,31 @@ struct PrePass {
 
 inline constexpr std::string_view MARKER_PREFIX = "__slug_stamp_";
 
+// Chord tolerance (canvas pixels, at the largest scale a prototype is used at) for flattening
+// and stroke-expanding prototypes.
+inline constexpr double PROTO_TOLERANCE_PX = 0.05;
+
+// Side of the picture prototypes are resolved in (prototype units, origin at its centre): room for
+// +-4 units (the recorder's unit-frame symbols reach +-1 plus stroke overhang), small enough that a
+// sliver prototype keeps float precision in the picture's pixel / em coordinates.
+inline constexpr int MINI_SIZE = 8;
+
+// How loadString() sets a prototype's flattening tolerances.
+enum class ProtoTolerance : uint8_t {
+	// PROTO_TOLERANCE_PX device (canvas) pixels at the largest scale the prototype is drawn at:
+	// tolerance = PROTO_TOLERANCE_PX / s, s the largest singular value of any of its uses'
+	// prototype -> canvas-pixel maps (every transform folded in), for stroke expansion, clip
+	// flattening and the cubic -> quadratic split alike; fills keep quadratic outlines (the resolve
+	// picture's viewport clip, which contains them, is not applied).
+	Device = 0,
+
+	// The fixed tolerances prototypes had before (LoadConfig defaults in the prototype frame: 0.05
+	// prototype units for strokes and clips, two quadratics per cubic, and the resolve picture's
+	// viewport clip applied, which flattens every fill to 0.05-unit polylines), i.e. up to 5% of
+	// the prototype. Kept only to measure what the device tolerance changes.
+	Legacy = 1
+};
+
 // Presentation attributes a <use> or its run <g> may pass down to the prototype.
 inline bool isPaintAttr(std::string_view k) {
 	return k == "fill" || k == "fill-opacity" || k == "fill-rule" || k == "opacity" || k == "stroke" ||
@@ -1148,10 +1207,25 @@ inline PrePass prePass(std::string_view svg) {
 	struct Open { Tag tag; int runIndex = -1; std::string symbolId; std::string id; };
 
 	std::vector<Open> stack;
+	std::vector<std::pair<size_t, size_t>> removals; // byte ranges dropped from the rewrite
 	size_t pos = 0;
 	Tag t;
 
 	while(nextTag(svg, pos, t)) {
+		// ThorVG 1.0.3 clones a <use>'s target once per href attribute: with both href and
+		// xlink:href it draws it twice. Keep href only (SVG 2 gives href precedence).
+		if(!t.closing && t.name == "use" && t.attr("href") && t.attr("xlink:href")) {
+			const std::string_view tag = svg.substr(t.begin, t.end - t.begin);
+			const size_t a = tag.find(" xlink:href=");
+
+			if(a != std::string_view::npos) {
+				const char q = tag.size() > a + 12 ? tag[a + 12] : 0;
+				const size_t e = (q == '"' || q == char(39)) ? tag.find(q, a + 13) : std::string_view::npos;
+
+				if(e != std::string_view::npos) removals.push_back({t.begin + a, t.begin + e + 1});
+			}
+		}
+
 		if(t.closing) {
 			while(!stack.empty()) {
 				Open o = std::move(stack.back());
@@ -1315,25 +1389,78 @@ inline PrePass prePass(std::string_view svg) {
 		}
 	}
 
-	// Rewrite: representable runs -> markers.
-	std::string& o = out.svg;
-	size_t at = 0;
+	// Rewrite: representable runs -> markers; duplicate xlink:href attributes dropped elsewhere.
+	struct Edit { size_t begin, end; std::string text; };
 
-	o.reserve(svg.size());
+	std::vector<Edit> edits;
 
 	for(size_t k = 0; k < out.runs.size(); k++) {
 		const Run& r = out.runs[k];
 
 		if(!r.ok || r.end <= r.begin) continue;
 
-		o.append(svg.substr(at, r.begin - at));
-		o += "<path id=\"" + std::string(MARKER_PREFIX) + std::to_string(k) + "\" d=\"M0 0H1V1H0Z\" fill=\"#000\"/>";
-		at = r.end;
+		edits.push_back({r.begin, r.end, "<path id=\"" + std::string(MARKER_PREFIX) + std::to_string(k) + "\" d=\"M0 0H1V1H0Z\" fill=\"#000\"/>"});
+	}
+
+	for(const auto& [b, e] : removals) {
+		bool inside = false;
+
+		for(const auto& ed : edits) if(b >= ed.begin && e <= ed.end && !ed.text.empty()) inside = true;
+
+		if(!inside) edits.push_back({b, e, std::string()});
+	}
+
+	std::sort(edits.begin(), edits.end(), [](const Edit& a, const Edit& b) { return a.begin < b.begin; });
+
+	std::string& o = out.svg;
+	size_t at = 0;
+
+	o.reserve(svg.size());
+
+	for(const Edit& ed : edits) {
+		if(ed.begin < at) continue;
+
+		o.append(svg.substr(at, ed.begin - at));
+		o += ed.text;
+		at = ed.end;
 	}
 
 	o.append(svg.substr(at));
 
 	return out;
+}
+
+// The SVG with every <use> carrying both href and xlink:href reduced to href (what the file means;
+// ThorVG 1.0.3 would draw such a use twice). Runs are left in place.
+inline std::string dedupeUseHref(std::string_view svg) {
+	using namespace detail;
+
+	std::string o;
+	size_t pos = 0, at = 0;
+	Tag t;
+
+	o.reserve(svg.size());
+
+	while(nextTag(svg, pos, t)) {
+		if(t.closing || t.name != "use" || !t.attr("href") || !t.attr("xlink:href")) continue;
+
+		const std::string_view tag = svg.substr(t.begin, t.end - t.begin);
+		const size_t a = tag.find(" xlink:href=");
+
+		if(a == std::string_view::npos) continue;
+
+		const char q = tag.size() > a + 12 ? tag[a + 12] : 0;
+		const size_t e = (q == '"' || q == char(39)) ? tag.find(q, a + 13) : std::string_view::npos;
+
+		if(e == std::string_view::npos) continue;
+
+		o.append(svg.substr(at, t.begin + a - at));
+		at = t.begin + e + 1;
+	}
+
+	o.append(svg.substr(at));
+
+	return o;
 }
 
 #ifdef SLUGHORN_HAS_THORVG
@@ -1364,7 +1491,7 @@ inline bool sameGradient(const GradientInfo& a, const GradientInfo& b) {
 //
 // Every distinct (symbol, paint signature) is resolved ONCE through ThorVG itself: the symbol's
 // content inside a <g> carrying the use's paint attributes (solid colors normalized to black,
-// gradients kept by url), in a 1 x 1 picture whose unit is the prototype frame. That one load
+// gradients kept by url), in a MINI_SIZE picture whose pixel is the prototype unit. That one load
 // yields the prototype's parts in paint order - fills, strokes already expanded to fill contours
 // (stroke prototypes become Curve prototypes), gradients converted into the prototype frame - so
 // mixed prototypes, url() fills and stroke symbols all follow ThorVG's own semantics. Rect and
@@ -1379,7 +1506,8 @@ inline CompositeShape loadString(
 	thorvg::LoadConfig* config,
 	Set& set,
 	const std::string& protoPrefix,
-	std::vector<std::string>* notes=nullptr
+	std::vector<std::string>* notes=nullptr,
+	ProtoTolerance protoTolerance=ProtoTolerance::Device
 ) {
 	using namespace detail;
 
@@ -1428,11 +1556,10 @@ inline CompositeShape loadString(
 		return text;
 	};
 
-	auto resolve = [&](const UseRef& u) -> const std::vector<Part>* {
-		const SymbolDef& def = pp.symbols.at(u.symbol);
-
+	// The <g> carrying a use's paint attributes (solid colors normalized to black, gradients kept
+	// by url) and the gradient defs it needs; signature = symbol + wrapper.
+	auto wrapper = [&](const UseRef& u, std::string* defs) {
 		std::string wrap = "<g";
-		std::string defs;
 
 		for(const auto& [k, v] : u.attrs) {
 			if(k == "fill-opacity" || k == "stroke-opacity" || k == "opacity") continue;
@@ -1442,15 +1569,84 @@ inline CompositeShape loadString(
 			if(k == "fill" || k == "stroke") {
 				const std::string g = urlId(v);
 
-				if(!g.empty()) defs += gradientText(g);
+				if(!g.empty()) { if(defs) *defs += gradientText(g); }
 				else if(v != "none") value = "#000";
 			}
 
 			wrap += " " + k + "=\"" + value + "\"";
 		}
 
-		wrap += ">";
+		return wrap + ">";
+	};
 
+	// A prototype is resolved in a MINI_SIZE x MINI_SIZE picture whose viewBox is centred on the
+	// prototype frame's origin, one unit a pixel: ThorVG clips every SVG to its root viewport, so a
+	// 1 x 1 picture would cut round caps, stroke overhang and the unit circle's negative half.
+	// Shapes load with autoMetrics (local to their own box, so a sliver keeps float precision);
+	// a layer's local em e maps to picture em e + D, D = transform - origin, and picture em to the
+	// prototype unit u = em * MINI_SIZE - MINI_SIZE / 2 (in double).
+	auto toUnit = [](slug_t local, double D) {
+		return slug_t((double(local) + D) * double(MINI_SIZE) - double(MINI_SIZE / 2));
+	};
+
+	// Gradient: local e = (u + o) / k - D = (u + o - k D) / k, i.e. the centred map with a per-axis
+	// offset o_x = o - k D_x, o_y = o - k D_y.
+	auto toUnitFrame = [&](GradientInfo g, double Dx, double Dy) {
+		const slug_t k = slug_t(MINI_SIZE);
+		const slug_t ox = slug_t(double(MINI_SIZE / 2) - double(MINI_SIZE) * Dx);
+		const slug_t oy = slug_t(double(MINI_SIZE / 2) - double(MINI_SIZE) * Dy);
+		Matrix& m = g.transform;
+
+		if(g.type == GradientInfo::Type::Linear) {
+			// t = xx e_x + xy e_y + dx with e = (u + o) / k
+			m.dx += (m.xx * ox + m.xy * oy) / k;
+			m.xx /= k;
+			m.xy /= k;
+		}
+
+		else {
+			// center e -> u; B maps em deltas, so B_unit = B_em / k.
+			m.dx = m.dx * k - ox;
+			m.dy = m.dy * k - oy;
+
+			if(g.type == GradientInfo::Type::AffineRadial) {
+				m.xx /= k; m.xy /= k; m.yx /= k; m.yy /= k;
+			}
+
+			else if(g.type == GradientInfo::Type::Radial) {
+				m.xx *= k;
+				g.innerRadius *= k;
+			}
+		}
+
+		return g;
+	};
+
+	// Flattening tolerances follow the LARGEST scale a prototype is drawn at: one prototype unit is
+	// one pixel of the resolve picture, so a stroke outline flattened to 0.05 px there would be 0.05
+	// of the unit prototype, i.e. up to 2 px for an instance scaled 40x. Per signature, the largest
+	// singular value of any use's prototype -> canvas-pixel map sets the tolerance (ProtoTolerance).
+	std::map<std::string, double> maxScale;
+
+	for(const Run& r : pp.runs) {
+		if(!r.ok) continue;
+
+		for(const UseRef& u : r.uses) {
+			const Matrix m = Matrix::scale(cfg.width, cfg.width) * toEm * u.m; // prototype -> canvas px
+			const double T = double(m.xx) * m.xx + double(m.yx) * m.yx + double(m.xy) * m.xy + double(m.yy) * m.yy;
+			const double D = double(m.xx) * m.yy - double(m.xy) * m.yx;
+			const double smax = std::sqrt(std::max(0.0, (T + std::sqrt(std::max(0.0, T * T - 4.0 * D * D))) * 0.5));
+			double& cur = maxScale[u.symbol + "|" + wrapper(u, nullptr)];
+
+			cur = std::max(cur, smax);
+		}
+	}
+
+	auto resolve = [&](const UseRef& u) -> const std::vector<Part>* {
+		const SymbolDef& def = pp.symbols.at(u.symbol);
+
+		std::string defs;
+		const std::string wrap = wrapper(u, &defs);
 		const std::string signature = u.symbol + "|" + wrap;
 
 		auto hit = resolved.find(signature);
@@ -1458,15 +1654,30 @@ inline CompositeShape loadString(
 		if(hit != resolved.end()) return &hit->second;
 
 		const std::string mini =
-			"<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"1\" height=\"1\" viewBox=\"0 0 1 1\"><defs>" +
+			"<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"" + std::to_string(MINI_SIZE) + "\" height=\"" + std::to_string(MINI_SIZE) +
+			"\" viewBox=\"" + std::to_string(-MINI_SIZE / 2) + " " + std::to_string(-MINI_SIZE / 2) + " " + std::to_string(MINI_SIZE) + " " + std::to_string(MINI_SIZE) + "\"><defs>" +
 			defs + "</defs>" + wrap + std::string(svg.substr(def.contentBegin, def.contentEnd - def.contentBegin)) + "</g></svg>";
 
 		Atlas tmp;
 		KeyIterator tk("q", true);
 		thorvg::LoadConfig mc;
 
-		mc.autoMetrics = false;
 		mc.log = [](int, std::string_view) {};
+
+		if(protoTolerance == ProtoTolerance::Device) {
+			// Prototype units are mini-picture pixels. Instances under 1 px a unit keep the
+			// 1 px-a-unit tolerance (finer than they need).
+			const double units = PROTO_TOLERANCE_PX / std::max(1.0, maxScale[signature]);
+
+			mc.strokeTolerancePx = slug_t(units);
+			mc.clipTolerancePx = slug_t(units);
+			mc.tolerancePx = slug_t(units);
+			mc.curveErrorBound = true;
+
+			// The resolve picture's own viewport clip contains the prototype: fills stay quadratic
+			// outlines instead of polylines.
+			mc.skipContainingRectClips = true;
+		}
 
 		const CompositeShape parts = thorvg::loadString(mini, tmp, tk, 96_cv, &mc);
 		std::vector<Part> out;
@@ -1481,8 +1692,12 @@ inline CompositeShape loadString(
 			p.stroke = li < mc.layers.size() && mc.layers[li].stroke;
 			p.color = l.color;
 
+			const auto sh = tmp.getShape(l.key);
+			const double Dx = sh ? double(l.transform.x) - double(sh->originX) : 0.0;
+			const double Dy = sh ? double(l.transform.y) - double(sh->originY) : 0.0;
+
 			if(l.gradientId > 0 && l.gradientId <= tmp.getGradients().size()) {
-				const GradientInfo& g = tmp.getGradients()[l.gradientId - 1];
+				const GradientInfo g = toUnitFrame(tmp.getGradients()[l.gradientId - 1], Dx, Dy);
 				uint32_t gi = 0;
 
 				for(size_t k = 0; k < set.gradients.size(); k++) if(sameGradient(set.gradients[k], g)) { gi = uint32_t(k + 1); break; }
@@ -1503,6 +1718,7 @@ inline CompositeShape loadString(
 					Proto pr;
 
 					pr.kind = def.kind;
+					fitExtent(pr);
 					set.protos.push_back(pr);
 					a = analyticProto.emplace(key, uint32_t(set.protos.size() - 1)).first;
 				}
@@ -1511,15 +1727,30 @@ inline CompositeShape loadString(
 			}
 
 			else {
-				const auto sh = tmp.getShape(l.key);
-
 				if(!sh || sh->curves.empty()) continue;
 
 				Proto pr;
 
 				pr.kind = Kind::Curve;
 				pr.curves = sh->curves;
+
+				for(auto& c : pr.curves) {
+					c.x1 = toUnit(c.x1, Dx); c.y1 = toUnit(c.y1, Dy);
+					c.x2 = toUnit(c.x2, Dx); c.y2 = toUnit(c.y2, Dy);
+					c.x3 = toUnit(c.x3, Dx); c.y3 = toUnit(c.y3, Dy);
+				}
+
+				if(notes) {
+					slug_t reach = 0_cv;
+
+					for(const auto& c : pr.curves) for(slug_t v : {c.x1, c.y1, c.x2, c.y2, c.x3, c.y3}) reach = std::max(reach, std::abs(v));
+
+					// ThorVG clips to the mini picture's viewport: geometry reaching its edge was cut.
+					if(reach >= slug_t(MINI_SIZE / 2) - 0.5_cv) notes->push_back("prototype " + u.symbol + " reaches the resolve picture's edge (clipped at +-" + std::to_string(MINI_SIZE / 2) + " units)");
+				}
+
 				pr.starts = sh->contourStarts;
+				fitExtent(pr);
 				set.protos.push_back(std::move(pr));
 				p.proto = uint32_t(set.protos.size() - 1);
 			}

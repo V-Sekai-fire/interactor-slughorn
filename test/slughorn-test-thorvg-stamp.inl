@@ -17,11 +17,19 @@ struct StampCase {
 	uint32_t depth = 0;
 };
 
-static void loadStamped(const std::string& svg, StampCase& sc, bool split=true) {
+// Stamp parity isolates the stamps: the canvas's own (non-stamp) layers and the <use>-expanded
+// reference both split cubics adaptively at STAMP_PARITY_TOLERANCE_PX instead of the default two
+// quadratics per cubic, whose error (~0.003 of a circle's radius, 0.4 px coverage at r = 120 px)
+// would otherwise be the reference's, not the stamps'. The production pipeline keeps the default
+// (the contact sheets measure it against ThorVG).
+static constexpr slug_t STAMP_PARITY_TOLERANCE_PX = 0.02_cv;
+
+static void loadStamped(const std::string& svg, StampCase& sc, bool split=true, slughorn::stamp::ProtoTolerance tol=slughorn::stamp::ProtoTolerance::Device) {
 	slughorn::KeyIterator keys("k", true);
 
 	sc.cfg.log = [](int, std::string_view) {};
-	sc.comp = slughorn::stamp::loadString(svg, sc.atlas, keys, &sc.cfg, sc.set, "proto/", &sc.notes);
+	sc.cfg.tolerancePx = STAMP_PARITY_TOLERANCE_PX;
+	sc.comp = slughorn::stamp::loadString(svg, sc.atlas, keys, &sc.cfg, sc.set, "proto/", &sc.notes, tol);
 
 	if(split && sc.cfg.width > 0_cv) sc.depth = slughorn::stamp::splitDeep(sc.set, sc.comp, 1_cv, sc.cfg.heightEm, sc.cfg.width);
 
@@ -32,6 +40,8 @@ static std::vector<slug_t> expandedRender(const std::string& svg, uint32_t W, ui
 	slughorn::Atlas atlas;
 	slughorn::KeyIterator keys("e", true);
 	auto cfg = quietConfig();
+
+	cfg.tolerancePx = STAMP_PARITY_TOLERANCE_PX;
 	auto comp = slughorn::thorvg::loadString(svg, atlas, keys, 96_cv, &cfg);
 
 	atlas.build();
@@ -50,7 +60,7 @@ static double shiftOneInstance(slughorn::stamp::Set& set, const std::vector<slug
 	const slug_t ppe = cv(W);
 
 	for(auto& l : set.layers) for(auto& in : l.instances) {
-		const auto b = slughorn::stamp::bounds(in, set.protos[in.proto].kind);
+		const auto b = slughorn::stamp::bounds(in, set);
 
 		if((b.x1 - b.x0) * ppe < 2_cv || (b.y1 - b.y0) * ppe < 2_cv || (b.x1 - b.x0) * (b.y1 - b.y0) > 0.05_cv * heightEm) continue;
 
@@ -143,6 +153,103 @@ void test_StampThorvgCaveats() {
 	checkNear("fill inherited from <use> (blue)", p[2], 0.5_cv, 0.02_cv);
 	checkNear("fill-opacity inherited from <use> (0.5)", p[3], 0.5_cv, 0.02_cv);
 	check("no red/green from a default fill", p[0] < 0.01_cv && p[1] < 0.01_cv);
+
+	// 4. A <use> carrying BOTH href and xlink:href is drawn TWICE by ThorVG 1.0.3 (each attribute
+	//    clones the target), so a 0.5-opaque instance lands at 0.75. Recorded, not hidden: the
+	//    recorder should emit one of them; stamp.hpp's runs are unaffected (one use = one instance).
+	const std::string both = head + R"SVG(<symbol id="r" overflow="visible"><path d="M0 0L1 0L1 1L0 1Z"/></symbol></defs><use href="#r" xlink:href="#r" transform="matrix(20 0 0 20 6 6)" fill="#0000ff" fill-opacity="0.5"/></svg>)SVG";
+	const auto pb = pixel(both, 16, 16);
+
+	std::cout << "  <use href + xlink:href> alpha " << pb[3] << " (once: 0.5)" << std::endl;
+	check("ThorVG draws a <use> with both href and xlink:href twice (known caveat)", std::abs(pb[3] - 0.75_cv) < 0.02_cv);
+
+	// 5. ThorVG's software stroker keeps HALF the stroke width in LOCAL units as 26.6 fixed point
+	//    (tvgSwStroke.cpp strokeReset: HALF_STROKE = TO_SWCOORD(width * 0.5)) and scales it after,
+	//    so a unit-frame stroke is quantized to 1/32 of a unit before the transform: width 0.05 under
+	//    x120 (6 px) is drawn 0.03125 x 120 = 3.75 px wide. A ground-truth defect, not slughorn's:
+	//    slughorn's own expansion of the same file is 6 px.
+	{
+		const std::string ring = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><g transform="matrix(120 0 0 120 4 4)"><path d="M1 0.5C1 0.776142 0.776142 1 0.5 1C0.223858 1 0 0.776142 0 0.5C0 0.223858 0.223858 0 0.5 0C0.776142 0 1 0.223858 1 0.5" fill="none" stroke="#000" stroke-width="0.05"/></g></svg>)SVG";
+		const uint32_t RW = 512;
+
+		// Ring width (px at 512) along the centre row's left edge, as summed coverage.
+		auto width = [&](const std::vector<slug_t>& img) {
+			double w = 0;
+
+			for(uint32_t x = 0; x < 64; x++) w += double(img[(size_t(RW / 2) * RW + x) * 4 + 3]);
+
+			return w / 4.0; // canvas px
+		};
+
+		const double tvg = width(thorvgRaster(ring, RW, RW));
+		const double precise = width(thorvgRaster(ring, RW, RW, true));
+		const double own = width(expandedRender(ring, RW, RW));
+
+		std::cout << "  stroke-width 0.05 under x120 (6 px): ThorVG raster " << tvg << " px, with thorvg-01 (swStrokePrecise) "
+			<< precise << " px, slughorn expansion " << own << " px" << std::endl;
+		check("slughorn expands a unit-frame stroke at its scaled width (6 px)", std::abs(own - 6.0) < 0.05);
+		check("ThorVG caveat: local half stroke width quantized to 1/64 (3.75 px drawn)", std::abs(tvg - 3.75) < 0.1);
+		check("thorvg-01 patch: swStrokePrecise draws the exact width (6 px)", std::abs(precise - 6.0) < 0.05);
+
+		// Below 1/32 of a unit the stock stroker draws nothing at all.
+		std::string thin = ring;
+
+		thin.replace(thin.find("stroke-width=\"0.05\""), std::string("stroke-width=\"0.05\"").size(), "stroke-width=\"0.025\"");
+
+		const double tvgThin = width(thorvgRaster(thin, RW, RW)), preciseThin = width(thorvgRaster(thin, RW, RW, true));
+
+		std::cout << "  stroke-width 0.025 under x120 (3 px): ThorVG raster " << tvgThin << " px, with thorvg-01 " << preciseThin << " px" << std::endl;
+		check("ThorVG caveat: a stroke under 1/32 of a local unit vanishes", tvgThin < 0.05);
+		check("thorvg-01 patch: ... and is drawn at 3 px with swStrokePrecise", std::abs(preciseThin - 3.0) < 0.05);
+	}
+}
+
+// A stroke prototype's outline leaves the unit square by half its width: instance bounds (CPU
+// decode boxes, shader cell binning, wrap copies, depth splits) must come from the prototype's own
+// extent. A ring x120: the stamp decode must match the <use>-expanded file; the control resets the
+// prototype's extent to the unit square (the old bounds) and must fail.
+void test_StampProtoExtent() {
+	std::cout << "\n=== test_StampProtoExtent ===" << std::endl;
+
+	const std::string svg = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><defs><symbol id="p1" data-stamp-kind="stroke" overflow="visible"><path d="M1 0.5C1 0.776142 0.776142 1 0.5 1C0.223858 1 0 0.776142 0 0.5C0 0.223858 0.223858 0 0.5 0C0.776142 0 1 0.223858 1 0.5" fill="none" stroke-width="0.05" stroke-miterlimit="10"/></symbol></defs><g data-stamp-run="0"><use href="#p1" transform="matrix(120 0 0 120 4 4)" stroke="#eb9db6"/></g></svg>)SVG";
+	const uint32_t W = 512, H = 512;
+
+	StampCase sc;
+
+	loadStamped(svg, sc);
+
+	check("one curve prototype, one instance", sc.set.protos.size() == 1 && sc.set.layers.size() == 1 && sc.set.layers[0].instances.size() == 1);
+
+	if(sc.set.protos.empty()) return;
+
+	const auto& pr = sc.set.protos[0];
+
+	std::cout << "  prototype extent [" << pr.x0 << "," << pr.y0 << " - " << pr.x1 << "," << pr.y1 << "]" << std::endl;
+	check("prototype extent includes the stroke overhang (-0.025 .. 1.025)", std::abs(pr.x0 + 0.025_cv) < 1e-3_cv && std::abs(pr.x1 - 1.025_cv) < 1e-3_cv);
+
+	const auto expanded = expandedRender(svg, W, H);
+	const Diff d = compare(slughorn::stamp::renderComposite(sc.atlas, sc.comp, sc.set, W, H, 0_cv, 0_cv, 1_cv, sc.cfg.heightEm).data, expanded);
+
+	std::cout << "  stamp vs expanded: mean|d|=" << d.mean << " bad=" << d.bad * 100 << "% flips=" << d.flips << " max|d|=" << d.maxd << std::endl;
+	check("ring stamp renders its full width", stampOk(d, size_t(W) * H) && d.flips == 0);
+
+	// Control: the old unit-square bounds.
+	slughorn::stamp::Set old = sc.set;
+
+	old.protos[0].x0 = old.protos[0].y0 = 0_cv;
+	old.protos[0].x1 = old.protos[0].y1 = 1_cv;
+
+	const Diff n = compare(slughorn::stamp::renderComposite(sc.atlas, sc.comp, old, W, H, 0_cv, 0_cv, 1_cv, sc.cfg.heightEm).data, expanded);
+
+	std::cout << "  control (unit-square bounds): mean|d|=" << n.mean << " bad=" << n.bad * 100 << "% flips=" << n.flips << " max|d|=" << n.maxd << std::endl;
+	check("negative control: unit-square bounds cut the overhang", !stampOk(n, size_t(W) * H));
+
+	// Every binning path (CPU boxes, shader cells, wrap copies, depth splits) uses bounds(): it must
+	// reach the ring's outer edge, x = 4 - 0.025 * 120 = 1 canvas px of 128.
+	const auto b = slughorn::stamp::bounds(sc.set.layers[0].instances[0], sc.set);
+
+	std::cout << "  instance bounds x0=" << b.x0 * 128_cv << " px (outer edge 1 px)" << std::endl;
+	check("instance bounds reach the overhang", b.x0 * 128_cv <= 1.001_cv);
 }
 
 void test_Stamp() {
@@ -307,7 +414,8 @@ int stampCompareFiles(int argc, char** argv) {
 		const uint32_t W = 256;
 		const auto H = static_cast<uint32_t>(std::max<long>(1, std::lround(W * sc.cfg.heightEm)));
 
-		const auto expanded = expandedRender(svg, W, H);
+		// ThorVG draws a <use> with both href and xlink:href twice; compare against what the file means.
+		const auto expanded = expandedRender(slughorn::stamp::dedupeUseHref(svg), W, H);
 		const Diff d = compare(slughorn::stamp::renderComposite(sc.atlas, sc.comp, sc.set, W, H, 0_cv, 0_cv, 1_cv, sc.cfg.heightEm).data, expanded);
 		const bool ok = stampOk(d, size_t(W) * H);
 
@@ -324,7 +432,7 @@ int stampCompareFiles(int argc, char** argv) {
 
 			for(size_t li = 0; li < sc.set.layers.size(); li++) for(size_t k = 0; k < sc.set.layers[li].instances.size(); k++) {
 				const auto& in = sc.set.layers[li].instances[k];
-				const auto b = slughorn::stamp::bounds(in, sc.set.protos[in.proto].kind);
+				const auto b = slughorn::stamp::bounds(in, sc.set);
 
 				if((b.x1 - b.x0) * ppe < 2_cv || (b.y1 - b.y0) * ppe < 2_cv || (b.x1 - b.x0) * (b.y1 - b.y0) > 0.05_cv * sc.cfg.heightEm) continue;
 
@@ -346,7 +454,7 @@ int stampCompareFiles(int argc, char** argv) {
 			for(size_t c = 0; c < std::min<size_t>(6, cand.size()); c++) {
 				slughorn::stamp::Set shifted = sc.set;
 				auto& in = shifted.layers[cand[c].second.first].instances[cand[c].second.second];
-				const auto b = slughorn::stamp::bounds(in, shifted.protos[in.proto].kind);
+				const auto b = slughorn::stamp::bounds(in, shifted);
 
 				in.m.dx += std::max(b.x1 - b.x0, 4_cv / ppe);
 
@@ -377,4 +485,133 @@ int stampCompareFiles(int argc, char** argv) {
 	}
 
 	return failures ? 1 : 0;
+}
+
+// A stroke prototype drawn at 40x: its outline (resolved once in the prototype frame) must stay
+// within 0.05 px of the same stroke expanded by ThorVG at canvas scale with a much finer tolerance
+// (0.002 px). Before prototype tolerances followed the instance scale, the prototype was
+// flattened to 0.05 of itself, i.e. ~2 px here.
+static double polylineDistance(const std::vector<std::vector<std::pair<double, double>>>& from, const std::vector<std::vector<std::pair<double, double>>>& to) {
+	double worst = 0.0;
+
+	for(const auto& poly : from) {
+		for(const auto& p : poly) {
+			double best = 1e30;
+
+			for(const auto& q : to) {
+				for(size_t i = 0; i < q.size(); i++) {
+					const auto& a = q[i];
+					const auto& b = q[(i + 1) % q.size()];
+					const double dx = b.first - a.first, dy = b.second - a.second;
+					const double l2 = dx * dx + dy * dy;
+					const double t = l2 > 0 ? std::clamp(((p.first - a.first) * dx + (p.second - a.second) * dy) / l2, 0.0, 1.0) : 0.0;
+					const double ex = a.first + dx * t - p.first, ey = a.second + dy * t - p.second;
+
+					best = std::min(best, ex * ex + ey * ey);
+				}
+			}
+
+			worst = std::max(worst, std::sqrt(best));
+		}
+	}
+
+	return worst;
+}
+
+static std::vector<std::vector<std::pair<double, double>>> flattenPx(const slughorn::Atlas::Contours& contours, const slughorn::Matrix& toPx) {
+	std::vector<std::vector<std::pair<double, double>>> out;
+
+	for(const auto& p : slughorn::clipper::toPaths(contours, 0.001_cv, toPx)) {
+		std::vector<std::pair<double, double>> poly;
+
+		for(const auto& pt : p) poly.push_back({pt.x, pt.y});
+
+		out.push_back(std::move(poly));
+	}
+
+	return out;
+}
+
+// The prototype of the file's first instance, at that instance's scale, against the same use
+// expanded by ThorVG at canvas scale with 0.002 px tolerances: largest outline distance (px) both
+// ways, for the device tolerance and for the legacy fixed one.
+struct ToleranceProbe {
+	double device = -1.0, legacy = -1.0;
+	size_t deviceCurves = 0, legacyCurves = 0;
+};
+
+static ToleranceProbe probeProtoTolerance(const std::string& svg, slug_t widthPx) {
+	ToleranceProbe out;
+
+	slughorn::Atlas ref;
+	slughorn::KeyIterator rk("r", true);
+	auto rcfg = quietConfig();
+
+	rcfg.strokeTolerancePx = 0.002_cv;
+	rcfg.clipTolerancePx = 0.002_cv;
+	rcfg.tolerance = 0.002_cv / widthPx; // em
+
+	auto rcomp = slughorn::thorvg::loadString(svg, ref, rk, 96_cv, &rcfg);
+
+	check("reference expands the first use", !rcomp.layers.empty());
+
+	if(rcomp.layers.empty()) return out;
+
+	const auto rshape = ref.getShape(rcomp.layers[0].key);
+	const slughorn::Matrix refPx = slughorn::Matrix::scale(rcfg.width, rcfg.width) *
+		slughorn::Matrix::translate(rcomp.layers[0].transform.x - rshape->originX, rcomp.layers[0].transform.y - rshape->originY);
+	const auto refOutline = flattenPx(ref.getShapeContours(rcomp.layers[0].key), refPx);
+
+	for(auto mode : {slughorn::stamp::ProtoTolerance::Device, slughorn::stamp::ProtoTolerance::Legacy}) {
+		StampCase sc;
+
+		loadStamped(svg, sc, true, mode);
+
+		if(sc.set.layers.empty() || sc.set.layers[0].instances.empty()) continue;
+
+		const auto& in = sc.set.layers[0].instances[0];
+		const auto& proto = sc.set.protos[in.proto];
+		const slughorn::Matrix toPx = slughorn::Matrix::scale(sc.cfg.width, sc.cfg.width) * in.m;
+		const auto outline = flattenPx(slughorn::clipper::splitContours(proto.curves, proto.starts), toPx);
+		const double d = std::max(polylineDistance(outline, refOutline), polylineDistance(refOutline, outline));
+
+		if(std::getenv("SLUG_PROBE_DUMP") && mode == slughorn::stamp::ProtoTolerance::Legacy) {
+			for(const auto& c : proto.curves) std::cout << "    q " << c.x1 << "," << c.y1 << " " << c.x2 << "," << c.y2 << " " << c.x3 << "," << c.y3 << std::endl;
+			for(auto st : proto.starts) std::cout << "    start " << st << std::endl;
+			std::cout << "    m " << in.m.xx << " " << in.m.yx << " " << in.m.xy << " " << in.m.yy << " " << in.m.dx << " " << in.m.dy << " width " << sc.cfg.width << std::endl;
+		}
+
+		if(mode == slughorn::stamp::ProtoTolerance::Device) { out.device = d; out.deviceCurves = proto.curves.size(); }
+		else { out.legacy = d; out.legacyCurves = proto.curves.size(); }
+	}
+
+	return out;
+}
+
+void test_StampStrokeTolerance() {
+	std::cout << "\n=== test_StampStrokeTolerance ===" << std::endl;
+
+	// A stroke prototype (round caps / joins, cubic centreline) and a fill prototype (unit circle
+	// as four cubics), each drawn at 40x and at 4x.
+	const std::string stroke = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><defs><symbol id="w" data-stamp-kind="path" overflow="visible"><path d="M0 0.5C0.3 0 0.7 1 1 0.5" fill="none" stroke-width="0.05" stroke-linecap="round" stroke-linejoin="round"/></symbol></defs><g data-stamp-run="0"><use href="#w" transform="matrix(40 0 0 40 20 30)" stroke="#203040"/><use href="#w" transform="matrix(4 0 0 4 80 100)" stroke="#203040"/></g></svg>)SVG";
+	const std::string fill = R"SVG(<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><defs><symbol id="c" data-stamp-kind="path" overflow="visible"><path d="M1 0C1 0.55228 0.55228 1 0 1C-0.55228 1 -1 0.55228 -1 0C-1 -0.55228 -0.55228 -1 0 -1C0.55228 -1 1 -0.55228 1 0Z"/></symbol></defs><g data-stamp-run="0"><use href="#c" transform="matrix(40 0 0 40 64 64)" fill="#203040"/><use href="#c" transform="matrix(4 0 0 4 110 110)" fill="#203040"/></g></svg>)SVG";
+
+	{
+		StampCase sc;
+
+		loadStamped(stroke, sc);
+
+		check("one stroke prototype, two instances", sc.set.protos.size() == 1 && sc.set.protos[0].kind == slughorn::stamp::Kind::Curve &&
+			sc.set.layers.size() == 1 && sc.set.layers[0].instances.size() == 2);
+	}
+
+	for(const auto& [name, svg] : {std::pair<const char*, const std::string*>{"stroke", &stroke}, {"cubic fill", &fill}}) {
+		const ToleranceProbe p = probeProtoTolerance(*svg, 128_cv);
+
+		std::cout << "  40x " << name << " prototype vs 0.002 px reference: device tolerance " << p.device << " px (" << p.deviceCurves
+			<< " curves), legacy fixed tolerance " << p.legacy << " px (" << p.legacyCurves << " curves)" << std::endl;
+
+		check((std::string("40x ") + name + " prototype within 0.05 px of the reference").c_str(), p.device >= 0.0 && p.device <= 0.05);
+		check((std::string("negative control: the legacy fixed tolerance misses 0.05 px (") + name + ")").c_str(), p.legacy > 0.05);
+	}
 }

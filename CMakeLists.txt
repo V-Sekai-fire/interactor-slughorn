@@ -189,29 +189,38 @@ if(SLUGHORN_THORVG)
 	# idempotent way as the NanoSVG patches above.
 	find_package(Git REQUIRED)
 
-	set(_slughorn_tvg_patch "${CMAKE_CURRENT_SOURCE_DIR}/ext/thorvg-00-let-delete-be-delete.diff")
-
-	execute_process(
-		COMMAND "${GIT_EXECUTABLE}" apply --reverse --check --ignore-whitespace "${_slughorn_tvg_patch}"
-		WORKING_DIRECTORY "${_slughorn_tvg}"
-		RESULT_VARIABLE _slughorn_tvg_patch_applied
-		OUTPUT_QUIET
-		ERROR_QUIET
+	# Our own: thorvg-01 gives the software stroker an opt-in exact stroke width
+	# (tvg::swStrokePrecise; stock ThorVG quantizes a stroke to 1/64 of a LOCAL unit, so unit-frame
+	# strokes under large transforms are drawn too thin or not at all). Only the test rasterizer sets
+	# it; the loader never rasterizes.
+	set(_slughorn_tvg_patches
+		"${CMAKE_CURRENT_SOURCE_DIR}/ext/thorvg-00-let-delete-be-delete.diff"
+		"${CMAKE_CURRENT_SOURCE_DIR}/ext/thorvg-01-stroke-width-precision.diff"
 	)
 
-	if(NOT _slughorn_tvg_patch_applied EQUAL 0)
-		message(STATUS "Applying thorvg patch: ${_slughorn_tvg_patch}")
-
+	foreach(_slughorn_tvg_patch ${_slughorn_tvg_patches})
 		execute_process(
-			COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace "${_slughorn_tvg_patch}"
+			COMMAND "${GIT_EXECUTABLE}" apply --reverse --check --ignore-whitespace "${_slughorn_tvg_patch}"
 			WORKING_DIRECTORY "${_slughorn_tvg}"
-			RESULT_VARIABLE _slughorn_tvg_patch_result
+			RESULT_VARIABLE _slughorn_tvg_patch_applied
+			OUTPUT_QUIET
+			ERROR_QUIET
 		)
 
-		if(NOT _slughorn_tvg_patch_result EQUAL 0)
-			message(FATAL_ERROR "Failed to apply thorvg patch: ${_slughorn_tvg_patch}")
+		if(NOT _slughorn_tvg_patch_applied EQUAL 0)
+			message(STATUS "Applying thorvg patch: ${_slughorn_tvg_patch}")
+
+			execute_process(
+				COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace "${_slughorn_tvg_patch}"
+				WORKING_DIRECTORY "${_slughorn_tvg}"
+				RESULT_VARIABLE _slughorn_tvg_patch_result
+			)
+
+			if(NOT _slughorn_tvg_patch_result EQUAL 0)
+				message(FATAL_ERROR "Failed to apply thorvg patch: ${_slughorn_tvg_patch}")
+			endif()
 		endif()
-	endif()
+	endforeach()
 	set(_slughorn_tvg_config "${CMAKE_CURRENT_BINARY_DIR}/thorvg-config")
 
 	set(_slughorn_tvg_threads "")

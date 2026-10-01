@@ -513,12 +513,18 @@ static std::vector<slug_t> slugRender(
 	return slughorn::render::renderComposite(atlas, composite, w, h, 0_cv, 0_cv, 1_cv, heightEm).data;
 }
 
+// ext/thorvg-01-stroke-width-precision.diff: the software stroker's opt-in exact stroke width.
+namespace tvg { extern bool swStrokePrecise; }
+
 // ThorVG's own software rasterizer (premultiplied RGBA floats), the ground truth for features
-// nanosvg lacks.
-static std::vector<slug_t> thorvgRaster(const std::string& svg, uint32_t w, uint32_t h) {
+// nanosvg lacks. @p preciseStrokes: stroke widths exact instead of stock ThorVG's 1/64-local-unit
+// quantization (see the patch).
+static std::vector<slug_t> thorvgRaster(const std::string& svg, uint32_t w, uint32_t h, bool preciseStrokes=false) {
 	std::vector<slug_t> out(size_t(w) * h * 4, 0_cv);
 
 	if(tvg::Initializer::init(0) != tvg::Result::Success) return out;
+
+	tvg::swStrokePrecise = preciseStrokes;
 
 	{
 		std::vector<uint32_t> buffer(size_t(w) * h, 0u);
@@ -548,6 +554,7 @@ static std::vector<slug_t> thorvgRaster(const std::string& svg, uint32_t w, uint
 		delete canvas;
 	}
 
+	tvg::swStrokePrecise = false;
 	tvg::Initializer::term();
 
 	return out;
@@ -962,7 +969,8 @@ int main(int argc, char** argv) {
 	if(argc >= 3 && std::string(argv[1]) == "--compare") return compareSVGFiles(argc, argv);
 #if defined(SLUGHORN_HAS_CLIPPER2) && defined(SLUGHORN_HAS_TESSELLATE)
 	if(argc >= 3 && std::string(argv[1]) == "--stamp-compare") return stampCompareFiles(argc, argv);
-	if(argc >= 4 && std::string(argv[1]) == "--contact-sheet") return contactSheets(argc, argv);
+	if(argc >= 3 && std::string(argv[1]) == "--contact-sheet") return contactSheets(argc, argv);
+	if(argc >= 5 && std::string(argv[1]) == "--debug-key") return debugKey(argc, argv);
 #endif
 
 	if(argc >= 2) {
@@ -984,6 +992,8 @@ int main(int argc, char** argv) {
 	test_Bake();
 	test_StampThorvgCaveats();
 	test_Stamp();
+	test_StampStrokeTolerance();
+	test_StampProtoExtent();
 	test_Cutout();
 #endif
 

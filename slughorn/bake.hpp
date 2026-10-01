@@ -800,66 +800,73 @@ inline BakedMesh bakeCutout(
 		std::vector<uint32_t> stack; // region indices, bottom -> top
 	};
 
-	std::vector<std::vector<Face>> tiles(G * G);
-
 	auto overlap = [](const detail::Box& a, const detail::Box& b) {
 		return a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1;
 	};
 
-	for(uint32_t ri = 0; ri < regions.size(); ri++) {
-		const detail::Box rb = boxOf(regions[ri].paths);
-		const int precision = clipper::precisionFor(regions[ri].paths);
+	std::vector<detail::Box> rbox(regions.size());
+	std::vector<int> rprec(regions.size());
 
-		const auto i0 = static_cast<size_t>(std::clamp(std::floor(double(rb.x0) / tw), 0.0, double(G - 1)));
-		const auto i1 = static_cast<size_t>(std::clamp(std::floor(double(rb.x1) / tw), 0.0, double(G - 1)));
-		const auto j0 = static_cast<size_t>(std::clamp(std::floor(double(rb.y0) / th), 0.0, double(G - 1)));
-		const auto j1 = static_cast<size_t>(std::clamp(std::floor(double(rb.y1) / th), 0.0, double(G - 1)));
-
-		for(size_t j = j0; j <= j1; j++) {
-			for(size_t i = i0; i <= i1; i++) {
-				const Clipper2Lib::RectD rect(tw * double(i), th * double(j), tw * double(i + 1), th * double(j + 1));
-				const clipper::Paths piece = Clipper2Lib::RectClip(rect, regions[ri].paths, precision);
-
-				if(piece.empty()) continue;
-
-				const detail::Box pb = boxOf(piece);
-				auto& faces = tiles[j * G + i];
-				std::vector<Face> next;
-				clipper::Paths covered;
-
-				next.reserve(faces.size() + 2);
-
-				for(Face& f : faces) {
-					if(!overlap(f.box, pb)) { next.push_back(std::move(f)); continue; }
-
-					clipper::Paths inter = clipper::intersect(f.paths, piece);
-
-					if(inter.empty()) { next.push_back(std::move(f)); continue; }
-
-					covered.insert(covered.end(), f.paths.begin(), f.paths.end());
-
-					clipper::Paths rest = clipper::difference(f.paths, piece);
-
-					if(!rest.empty()) next.push_back({rest, boxOf(rest), f.stack});
-
-					std::vector<uint32_t> stack = f.stack;
-
-					stack.push_back(ri);
-					next.push_back({inter, boxOf(inter), std::move(stack)});
-				}
-
-				clipper::Paths uncovered = covered.empty() ? piece : clipper::difference(piece, covered);
-
-				if(!uncovered.empty()) next.push_back({uncovered, boxOf(uncovered), {ri}});
-
-				faces = std::move(next);
-			}
-		}
+	for(size_t ri = 0; ri < regions.size(); ri++) {
+		rbox[ri] = boxOf(regions[ri].paths);
+		rprec[ri] = clipper::precisionFor(regions[ri].paths);
 	}
+
+	// One tile's arrangement: every region overlapping it, clipped to it, inserted in paint order.
+	auto buildTile = [&](size_t ti) {
+		const size_t i = ti % G, j = ti / G;
+		const double x0 = tw * double(i), y0 = th * double(j), x1 = tw * double(i + 1), y1 = th * double(j + 1);
+		const Clipper2Lib::RectD rect(x0, y0, x1, y1);
+		std::vector<Face> faces;
+
+		for(uint32_t ri = 0; ri < regions.size(); ri++) {
+			const detail::Box& rb = rbox[ri];
+
+			if(double(rb.x1) < x0 || double(rb.x0) > x1 || double(rb.y1) < y0 || double(rb.y0) > y1) continue;
+
+			const clipper::Paths piece = Clipper2Lib::RectClip(rect, regions[ri].paths, rprec[ri]);
+
+			if(piece.empty()) continue;
+
+			const detail::Box pb = boxOf(piece);
+			std::vector<Face> next;
+			clipper::Paths covered;
+
+			next.reserve(faces.size() + 2);
+
+			for(Face& f : faces) {
+				if(!overlap(f.box, pb)) { next.push_back(std::move(f)); continue; }
+
+				clipper::Paths inter = clipper::intersect(f.paths, piece);
+
+				if(inter.empty()) { next.push_back(std::move(f)); continue; }
+
+				covered.insert(covered.end(), f.paths.begin(), f.paths.end());
+
+				clipper::Paths rest = clipper::difference(f.paths, piece);
+
+				if(!rest.empty()) next.push_back({rest, boxOf(rest), f.stack});
+
+				std::vector<uint32_t> stack = f.stack;
+
+				stack.push_back(ri);
+				next.push_back({inter, boxOf(inter), std::move(stack)});
+			}
+
+			clipper::Paths uncovered = covered.empty() ? piece : clipper::difference(piece, covered);
+
+			if(!uncovered.empty()) next.push_back({uncovered, boxOf(uncovered), {ri}});
+
+			faces = std::move(next);
+		}
+
+		return faces;
+	};
 
 	// Keep / drop faces.
 	const double test = cfg.alphaTest;
 	std::map<std::array<int64_t, 3>, uint16_t> solidIds;
+	std::map<std::vector<int64_t>, uint16_t> rampIds;
 
 	struct Kept {
 		clipper::Paths paths;
@@ -888,7 +895,9 @@ inline BakedMesh bakeCutout(
 		return id;
 	};
 
-	for(const auto& faces : tiles) {
+	for(size_t ti = 0; ti < G * G; ti++) {
+		const std::vector<Face> faces = buildTile(ti);
+
 		for(const Face& f : faces) {
 			int gradientCount = 0;
 			int gradientAt = -1;
@@ -1024,9 +1033,22 @@ inline BakedMesh bakeCutout(
 				paint.innerRadius = span != 0_cv ? gp.g->innerRadius / span : 0_cv;
 			}
 
-			const auto paintId = static_cast<uint16_t>(mesh.paints.size());
+			// Identical composite ramps (same gradient under the same solids) share one paint.
+			std::vector<int64_t> sig{int64_t(paint.type), std::llround(double(paint.innerRadius) * 65536)};
 
-			mesh.paints.push_back(paint);
+			for(const auto& st : paint.stops) {
+				for(double v : {double(st.t), double(st.color.r), double(st.color.g), double(st.color.b)}) sig.push_back(std::llround(v * 65536));
+			}
+
+			uint16_t paintId;
+
+			if(auto it = rampIds.find(sig); it != rampIds.end()) paintId = it->second;
+
+			else {
+				paintId = static_cast<uint16_t>(mesh.paints.size());
+				mesh.paints.push_back(paint);
+				rampIds.emplace(std::move(sig), paintId);
+			}
 
 			// Clip the face to the kept t-set.
 			const double bx0 = double(f.box.x0) - 1, by0 = double(f.box.y0) - 1, bx1 = double(f.box.x1) + 1, by1 = double(f.box.y1) + 1;
@@ -1118,73 +1140,74 @@ inline BakedMesh bakeCutout(
 
 			if(!keepRegion.empty()) kept.push_back({std::move(keepRegion), paintId, &gp});
 		}
-	}
+		// Emit this tile's kept faces (everything opaque, no overlay), then drop them.
+		for(const Kept& k : kept) {
+			const tessellate::Mesh2D tri = detail::triangulateTiled(k.paths);
+			const auto base = static_cast<uint32_t>(mesh.positions.size() / 2);
 
-	// Emit (everything opaque, no overlay).
-	for(const Kept& k : kept) {
-		const tessellate::Mesh2D tri = detail::triangulateTiled(k.paths);
-		const auto base = static_cast<uint32_t>(mesh.positions.size() / 2);
+			for(size_t v = 0; v + 1 < tri.positions.size(); v += 2) {
+				const double x = tri.positions[v], y = tri.positions[v + 1];
 
-		for(size_t v = 0; v + 1 < tri.positions.size(); v += 2) {
-			const double x = tri.positions[v], y = tri.positions[v + 1];
+				mesh.positions.push_back(static_cast<float>(x / cfg.width));
+				mesh.positions.push_back(static_cast<float>(cfg.vUp ? 1.0 - y / cfg.height : y / cfg.height));
+				mesh.paintIds.push_back(k.paint);
 
-			mesh.positions.push_back(static_cast<float>(x / cfg.width));
-			mesh.positions.push_back(static_cast<float>(cfg.vUp ? 1.0 - y / cfg.height : y / cfg.height));
-			mesh.paintIds.push_back(k.paint);
+				slug_t p0 = 0_cv, p1 = 0_cv;
 
-			slug_t p0 = 0_cv, p1 = 0_cv;
+				if(k.gradient) {
+					slug_t lx, ly;
 
-			if(k.gradient) {
-				slug_t lx, ly;
+					k.gradient->toLocal.apply(slug_t(x), slug_t(y), lx, ly);
 
-				k.gradient->toLocal.apply(slug_t(x), slug_t(y), lx, ly);
+					const Matrix& m = k.gradient->g->transform;
 
-				const Matrix& m = k.gradient->g->transform;
+					switch(k.gradient->g->type) {
+						case GradientInfo::Type::Linear:
+							p0 = m.xx * lx + m.xy * ly + m.dx;
+							break;
 
-				switch(k.gradient->g->type) {
-					case GradientInfo::Type::Linear:
-						p0 = m.xx * lx + m.xy * ly + m.dx;
-						break;
+						case GradientInfo::Type::AffineRadial:
+							p0 = m.xx * (lx - m.dx) + m.xy * (ly - m.dy);
+							p1 = m.yx * (lx - m.dx) + m.yy * (ly - m.dy);
+							break;
 
-					case GradientInfo::Type::AffineRadial:
-						p0 = m.xx * (lx - m.dx) + m.xy * (ly - m.dy);
-						p1 = m.yx * (lx - m.dx) + m.yy * (ly - m.dy);
-						break;
+						case GradientInfo::Type::Radial: {
+							const slug_t span = m.xx - k.gradient->g->innerRadius;
+							const slug_t kk = span != 0_cv ? 1_cv / span : 0_cv;
 
-					case GradientInfo::Type::Radial: {
-						const slug_t span = m.xx - k.gradient->g->innerRadius;
-						const slug_t kk = span != 0_cv ? 1_cv / span : 0_cv;
+							p0 = (lx - m.dx) * kk;
+							p1 = (ly - m.dy) * kk;
+							break;
+						}
 
-						p0 = (lx - m.dx) * kk;
-						p1 = (ly - m.dy) * kk;
-						break;
+						default:
+							break;
 					}
-
-					default:
-						break;
 				}
+
+				mesh.params.push_back(static_cast<float>(p0));
+				mesh.params.push_back(static_cast<float>(p1));
 			}
 
-			mesh.params.push_back(static_cast<float>(p0));
-			mesh.params.push_back(static_cast<float>(p1));
+			for(size_t t = 0; t + 2 < tri.indices.size(); t += 3) {
+				uint32_t a = base + tri.indices[t], b = base + tri.indices[t + 1], c = base + tri.indices[t + 2];
+
+				const float* P = mesh.positions.data();
+				const double area2 =
+					(double(P[b * 2]) - P[a * 2]) * (double(P[c * 2 + 1]) - P[a * 2 + 1]) -
+					(double(P[c * 2]) - P[a * 2]) * (double(P[b * 2 + 1]) - P[a * 2 + 1])
+				;
+
+				if(area2 == 0.0) continue;
+				if(area2 < 0.0) std::swap(b, c);
+
+				mesh.indices.push_back(a);
+				mesh.indices.push_back(b);
+				mesh.indices.push_back(c);
+			}
 		}
 
-		for(size_t t = 0; t + 2 < tri.indices.size(); t += 3) {
-			uint32_t a = base + tri.indices[t], b = base + tri.indices[t + 1], c = base + tri.indices[t + 2];
-
-			const float* P = mesh.positions.data();
-			const double area2 =
-				(double(P[b * 2]) - P[a * 2]) * (double(P[c * 2 + 1]) - P[a * 2 + 1]) -
-				(double(P[c * 2]) - P[a * 2]) * (double(P[b * 2 + 1]) - P[a * 2 + 1])
-			;
-
-			if(area2 == 0.0) continue;
-			if(area2 < 0.0) std::swap(b, c);
-
-			mesh.indices.push_back(a);
-			mesh.indices.push_back(b);
-			mesh.indices.push_back(c);
-		}
+		kept.clear();
 	}
 
 	mesh.opaqueIndexCount = static_cast<uint32_t>(mesh.indices.size());
@@ -1289,17 +1312,13 @@ inline BakedMesh bakeMesh(
 		regions.push_back({li, std::move(paths), paint.opaque});
 	}
 
-	// Tile the canvas: every region is cut (Clipper2 RectClip, holes stay holes) into a grid of
-	// tiles sized to ~PLANAR_TILE_VERTICES vertices, and planarization + triangulation run per
-	// tile. Without tiling, a big merged region pays for every occluder above it anywhere on the
-	// canvas, which is quadratic in practice (the station's text / speckle atlases). Clipping to
-	// the canvas rectangle is also the canvas's own semantics (nothing draws outside it).
-	struct Piece {
-		size_t tile;
-		clipper::Paths paths;
-		detail::Box box;
-	};
-
+	// Tile the canvas into a grid sized to ~PLANAR_TILE_VERTICES region vertices a tile, and run
+	// clipping (Clipper2 RectClip, holes stay holes), planarization and triangulation one tile at a
+	// time, emitting and dropping each tile's work before the next. Without tiling a big merged
+	// region pays for every occluder above it anywhere on the canvas (quadratic in practice); and
+	// streaming keeps the peak live-allocation count to one tile's (the sandbox caps it). Tiles are
+	// disjoint, so the overlay's order across tiles is free; within a tile it is paint order.
+	// Clipping to the canvas rectangle is also the canvas's own semantics.
 	auto boxOf = [](const clipper::Paths& paths) {
 		detail::Box b;
 
@@ -1318,60 +1337,12 @@ inline BakedMesh bakeMesh(
 
 	const double tw = double(cfg.width) / double(G), th = double(cfg.height) / double(G);
 
-	std::vector<std::vector<Piece>> pieces(regions.size());
+	std::vector<detail::Box> rbox(regions.size());
+	std::vector<int> rprec(regions.size());
 
 	for(size_t ri = 0; ri < regions.size(); ri++) {
-		const detail::Box b = boxOf(regions[ri].paths);
-		const int precision = clipper::precisionFor(regions[ri].paths);
-
-		const auto i0 = static_cast<size_t>(std::clamp(std::floor(double(b.x0) / tw), 0.0, double(G - 1)));
-		const auto i1 = static_cast<size_t>(std::clamp(std::floor(double(b.x1) / tw), 0.0, double(G - 1)));
-		const auto j0 = static_cast<size_t>(std::clamp(std::floor(double(b.y0) / th), 0.0, double(G - 1)));
-		const auto j1 = static_cast<size_t>(std::clamp(std::floor(double(b.y1) / th), 0.0, double(G - 1)));
-
-		for(size_t j = j0; j <= j1; j++) {
-			for(size_t i = i0; i <= i1; i++) {
-				const Clipper2Lib::RectD rect(tw * double(i), th * double(j), tw * double(i + 1), th * double(j + 1));
-
-				clipper::Paths piece = Clipper2Lib::RectClip(rect, regions[ri].paths, precision);
-
-				if(piece.empty()) continue;
-
-				const detail::Box pb = boxOf(piece);
-
-				pieces[ri].push_back({j * G + i, std::move(piece), pb});
-			}
-		}
-	}
-
-	// Planarize, per tile: top -> bottom, subtract every opaque piece above. Pieces are
-	// normalized (every covered point has winding exactly 1, holes included), so a plain
-	// concatenation of several IS their union under the nonzero rule - no incremental union.
-	if(cfg.planarize) {
-		struct Occluder {
-			clipper::Paths paths;
-			detail::Box box;
-		};
-
-		std::vector<std::vector<Occluder>> occluders(G * G);
-
-		for(size_t ri = regions.size(); ri-- > 0;) {
-			for(Piece& pc : pieces[ri]) {
-				auto& occ = occluders[pc.tile];
-				clipper::Paths full = regions[ri].opaque ? pc.paths : clipper::Paths{};
-				clipper::Paths clips;
-
-				for(const auto& o : occ) {
-					if(o.box.x0 <= pc.box.x1 && pc.box.x0 <= o.box.x1 && o.box.y0 <= pc.box.y1 && pc.box.y0 <= o.box.y1) {
-						clips.insert(clips.end(), o.paths.begin(), o.paths.end());
-					}
-				}
-
-				if(!clips.empty()) pc.paths = clipper::difference(pc.paths, clips);
-
-				if(regions[ri].opaque) occ.push_back({std::move(full), pc.box});
-			}
-		}
+		rbox[ri] = boxOf(regions[ri].paths);
+		rprec[ri] = clipper::precisionFor(regions[ri].paths);
 	}
 
 	std::vector<uint32_t> overlay;
@@ -1397,45 +1368,43 @@ inline BakedMesh bakeMesh(
 		return id;
 	};
 
-	for(size_t ri = 0; ri < regions.size(); ri++) {
+	// Per region (lazily): its paint id and how a vertex maps into its gradient's space.
+	struct RegionPaint {
+		bool ready = false;
+		uint16_t id = 0;
+		const GradientInfo* grad = nullptr;
+		bool stampFrame = false;
+		stamp::Inverse inv;
+		slug_t s = 1_cv, ox = 0_cv, oy = 0_cv;
+	};
+
+	std::vector<RegionPaint> rpaint(regions.size());
+
+	auto paintFor = [&](size_t ri) -> const RegionPaint& {
+		RegionPaint& rp = rpaint[ri];
+
+		if(rp.ready) return rp;
+
+		rp.ready = true;
+
 		const Region& r = regions[ri];
-
-		// Triangulate this region's surviving pieces (tile by tile).
-		tessellate::Mesh2D tri;
-
-		for(const Piece& pc : pieces[ri]) {
-			if(pc.paths.empty()) continue;
-
-			const tessellate::Mesh2D m = detail::triangulateTiled(pc.paths);
-			const auto off = static_cast<uint32_t>(tri.positions.size() / 2);
-
-			tri.positions.insert(tri.positions.end(), m.positions.begin(), m.positions.end());
-
-			for(uint32_t idx : m.indices) tri.indices.push_back(off + idx);
-		}
-
-		if(tri.indices.empty()) continue;
-
 		const Layer& layer = composite.layers[r.layer];
 		const LayerSource src = r.layer < meta.size() ? meta[r.layer] : LayerSource{};
 		const auto shape = r.stamp ? std::optional<Atlas::Shape>{} : atlas.getShape(layer.key);
 
-		const GradientInfo* grad = (!r.stamp && layer.gradientId > 0 && layer.gradientId <= gradients.size())
-			? &gradients[layer.gradientId - 1]
-			: nullptr
-		;
+		rp.grad = (!r.stamp && layer.gradientId > 0 && layer.gradientId <= gradients.size()) ? &gradients[layer.gradientId - 1] : nullptr;
+		rp.s = layer.scale;
+		rp.ox = shape ? (layer.transform.x - shape->originX) * rp.s : 0_cv;
+		rp.oy = shape ? (layer.transform.y - shape->originY) * rp.s : 0_cv;
 
 		// Stamp instance with a prototype-frame gradient: params come from the unit frame.
-		stamp::Inverse stampInv;
-
 		if(r.stamp && r.inst && r.inst->gradient && stamps && r.inst->gradient <= stamps->gradients.size()) {
-			grad = &stamps->gradients[r.inst->gradient - 1];
-			stampInv = stamp::invert(r.inst->m);
+			rp.grad = &stamps->gradients[r.inst->gradient - 1];
+			rp.stampFrame = true;
+			rp.inv = stamp::invert(r.inst->m);
 		}
 
-		uint16_t paintId = 0;
-
-		if(r.stamp && grad) {
+		if(r.stamp && rp.grad) {
 			// One paint per (gradient, tint).
 			const std::array<int64_t, 5> k{
 				-int64_t(r.inst->gradient), std::llround(double(r.color.r) * 65536), std::llround(double(r.color.g) * 65536),
@@ -1444,14 +1413,14 @@ inline BakedMesh bakeMesh(
 
 			auto it = solidIds.find(k);
 
-			if(it != solidIds.end()) paintId = it->second;
+			if(it != solidIds.end()) rp.id = it->second;
 
 			else {
 				Paint p;
 
-				p.type = grad->type == GradientInfo::Type::Linear ? Paint::Type::Linear : Paint::Type::Radial;
-				p.stops = grad->stops;
-				p.innerRadius = grad->innerRadius;
+				p.type = rp.grad->type == GradientInfo::Type::Linear ? Paint::Type::Linear : Paint::Type::Radial;
+				p.stops = rp.grad->stops;
+				p.innerRadius = rp.grad->innerRadius;
 				p.opaque = r.opaque;
 
 				for(auto& st : p.stops) {
@@ -1461,9 +1430,9 @@ inline BakedMesh bakeMesh(
 					st.color.a *= r.color.a;
 				}
 
-				paintId = static_cast<uint16_t>(mesh.paints.size());
+				rp.id = static_cast<uint16_t>(mesh.paints.size());
 				mesh.paints.push_back(p);
-				solidIds[k] = paintId;
+				solidIds[k] = rp.id;
 			}
 		}
 
@@ -1472,47 +1441,54 @@ inline BakedMesh bakeMesh(
 
 			p.color = r.color;
 			p.opaque = r.opaque;
-			paintId = solidPaint(p);
+			rp.id = solidPaint(p);
 		}
 
-		else if(!grad) paintId = solidPaint(detail::paintOf(atlas, layer, src, cfg.opaqueAlpha));
+		else if(!rp.grad) rp.id = solidPaint(detail::paintOf(atlas, layer, src, cfg.opaqueAlpha));
 
 		else {
-			paintId = static_cast<uint16_t>(mesh.paints.size());
+			rp.id = static_cast<uint16_t>(mesh.paints.size());
 			mesh.paints.push_back(detail::paintOf(atlas, layer, src, cfg.opaqueAlpha));
 		}
 
-		const auto base = static_cast<uint32_t>(mesh.positions.size() / 2);
+		if(rp.grad && rp.grad->type == GradientInfo::Type::Radial) {
+			const slug_t span = rp.grad->transform.xx - rp.grad->innerRadius;
 
-		const slug_t s = layer.scale;
-		const slug_t ox = shape ? (layer.transform.x - shape->originX) * s : 0_cv;
-		const slug_t oy = shape ? (layer.transform.y - shape->originY) * s : 0_cv;
+			mesh.paints[rp.id].innerRadius = span != 0_cv ? rp.grad->innerRadius / span : 0_cv;
+		}
+
+		return rp;
+	};
+
+	auto emit = [&](const tessellate::Mesh2D& tri, size_t ri) {
+		const RegionPaint& rp = paintFor(ri);
+		const auto base = static_cast<uint32_t>(mesh.positions.size() / 2);
 
 		for(size_t v = 0; v + 1 < tri.positions.size(); v += 2) {
 			const slug_t x = tri.positions[v], y = tri.positions[v + 1];
 
 			mesh.positions.push_back(static_cast<float>(x / cfg.width));
 			mesh.positions.push_back(static_cast<float>(cfg.vUp ? 1_cv - y / cfg.height : y / cfg.height));
-			mesh.paintIds.push_back(paintId);
+			mesh.paintIds.push_back(rp.id);
 
 			slug_t p0 = 0_cv, p1 = 0_cv;
 
-			if(grad) {
+			if(rp.grad) {
 				// Back to the space GradientInfo lives in: the layer's local em-space, or a stamp
 				// instance's prototype unit frame.
-				slug_t lx = (x / ppe - ox) / s;
-				slug_t ly = (y / ppe - oy) / s;
+				slug_t lx = (x / ppe - rp.ox) / rp.s;
+				slug_t ly = (y / ppe - rp.oy) / rp.s;
 
-				if(r.stamp) {
+				if(rp.stampFrame) {
 					const slug_t ex = x / ppe, ey = y / ppe;
 
-					lx = stampInv.a * ex + stampInv.b * ey + stampInv.e;
-					ly = stampInv.c * ex + stampInv.d * ey + stampInv.f;
+					lx = rp.inv.a * ex + rp.inv.b * ey + rp.inv.e;
+					ly = rp.inv.c * ex + rp.inv.d * ey + rp.inv.f;
 				}
 
-				const Matrix& m = grad->transform;
+				const Matrix& m = rp.grad->transform;
 
-				switch(grad->type) {
+				switch(rp.grad->type) {
 					case GradientInfo::Type::Linear:
 						p0 = m.xx * lx + m.xy * ly + m.dx;
 						break;
@@ -1527,8 +1503,8 @@ inline BakedMesh bakeMesh(
 					}
 
 					case GradientInfo::Type::Radial: {
-						// Circular: normalize by (r1 - r0) so t = length(param) - r0/(r1-r0).
-						const slug_t span = m.xx - grad->innerRadius;
+						// Circular: normalize by the span so t = length(param) - inner / span.
+						const slug_t span = m.xx - rp.grad->innerRadius;
 						const slug_t k = span != 0_cv ? 1_cv / span : 0_cv;
 
 						p0 = (lx - m.dx) * k;
@@ -1548,13 +1524,7 @@ inline BakedMesh bakeMesh(
 			mesh.params.push_back(static_cast<float>(p1));
 		}
 
-		if(grad && grad->type == GradientInfo::Type::Radial) {
-			const slug_t span = grad->transform.xx - grad->innerRadius;
-
-			mesh.paints[paintId].innerRadius = span != 0_cv ? grad->innerRadius / span : 0_cv;
-		}
-
-		auto& dstIdx = (r.opaque && cfg.planarize) ? mesh.indices : overlay;
+		auto& dstIdx = (regions[ri].opaque && cfg.planarize) ? mesh.indices : overlay;
 
 		for(size_t t = 0; t + 2 < tri.indices.size(); t += 3) {
 			uint32_t a = base + tri.indices[t], b = base + tri.indices[t + 1], c = base + tri.indices[t + 2];
@@ -1572,6 +1542,66 @@ inline BakedMesh bakeMesh(
 			dstIdx.push_back(a);
 			dstIdx.push_back(b);
 			dstIdx.push_back(c);
+		}
+	};
+
+	struct Piece {
+		size_t region;
+		clipper::Paths paths;
+		detail::Box box;
+	};
+
+	for(size_t j = 0; j < G; j++) {
+		for(size_t i = 0; i < G; i++) {
+			const double x0 = tw * double(i), y0 = th * double(j), x1 = tw * double(i + 1), y1 = th * double(j + 1);
+			const Clipper2Lib::RectD rect(x0, y0, x1, y1);
+
+			std::vector<Piece> pieces;
+
+			for(size_t ri = 0; ri < regions.size(); ri++) {
+				const detail::Box& b = rbox[ri];
+
+				if(double(b.x1) < x0 || double(b.x0) > x1 || double(b.y1) < y0 || double(b.y0) > y1) continue;
+
+				clipper::Paths piece = Clipper2Lib::RectClip(rect, regions[ri].paths, rprec[ri]);
+
+				if(piece.empty()) continue;
+
+				const detail::Box pb = boxOf(piece);
+
+				pieces.push_back({ri, std::move(piece), pb});
+			}
+
+			// Planarize: top -> bottom, subtract every opaque piece above. Pieces are normalized
+			// (every covered point has winding exactly 1, holes included), so a plain concatenation
+			// of several IS their union under the nonzero rule - no incremental union.
+			if(cfg.planarize) {
+				std::vector<std::pair<clipper::Paths, detail::Box>> occ;
+
+				for(size_t k = pieces.size(); k-- > 0;) {
+					Piece& pc = pieces[k];
+					clipper::Paths full = regions[pc.region].opaque ? pc.paths : clipper::Paths{};
+					clipper::Paths clips;
+
+					for(const auto& [paths, box] : occ) {
+						if(box.x0 <= pc.box.x1 && pc.box.x0 <= box.x1 && box.y0 <= pc.box.y1 && pc.box.y0 <= box.y1) {
+							clips.insert(clips.end(), paths.begin(), paths.end());
+						}
+					}
+
+					if(!clips.empty()) pc.paths = clipper::difference(pc.paths, clips);
+
+					if(regions[pc.region].opaque) occ.push_back({std::move(full), pc.box});
+				}
+			}
+
+			for(const Piece& pc : pieces) {
+				if(pc.paths.empty()) continue;
+
+				const tessellate::Mesh2D tri = detail::triangulateTiled(pc.paths);
+
+				if(!tri.indices.empty()) emit(tri, pc.region);
+			}
 		}
 	}
 

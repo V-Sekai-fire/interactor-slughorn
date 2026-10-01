@@ -159,14 +159,31 @@ struct LoadConfig {
 	bool strokes = true;
 
 	// CurveDecomposer tolerance for path cubics, in em-space. TOLERANCE_EXACT (default) emits the
-	// fixed two-quadratics-per-cubic leaf, matching nanosvg.hpp bit for bit.
+	// fixed two-quadratics-per-cubic leaf, matching nanosvg.hpp bit for bit (its error grows with
+	// the curve: ~0.003 of a circle's radius).
 	slug_t tolerance = TOLERANCE_EXACT;
+
+	// The same tolerance in authoring pixels; when > 0 it overrides `tolerance`.
+	slug_t tolerancePx = 0_cv;
+
+	// When true, the tolerance bounds each cubic's distance to its quadratics
+	// (CurveDecomposer::errorBound) rather than its flatness: the same accuracy from far fewer
+	// curves.
+	bool curveErrorBound = false;
 
 	// Centerline flattening tolerance for stroke expansion, in authoring pixels.
 	slug_t strokeTolerancePx = 0.05_cv;
 
 	// Flattening tolerance for clip-path / mask booleans, in authoring pixels.
 	slug_t clipTolerancePx = 0.05_cv;
+
+	// ThorVG's SVG loader clips every document to its viewport (svgSceneBuild adds a (0, 0, w, h)
+	// clip to the root scene), so every shape carries a clip, and a clipped layer is intersected
+	// with Clipper2 - i.e. flattened to clipTolerancePx polylines. When true, a clip that is an
+	// axis-aligned rectangle containing a nonzero layer's geometry (control-point hull) is not
+	// applied: it cannot cut anything, and the layer keeps its curves. Masks, inverse masks,
+	// non-rect clips and even-odd layers (which need the Clipper2 pass) are always applied.
+	bool skipContainingRectClips = false;
 
 	// Output fields.
 	//
@@ -345,7 +362,7 @@ struct PxGeometry {
 
 // Walks a shape's path commands through @p world into picture pixels. Every sub-path is closed
 // (fill semantics); even-odd sub-paths are winding-flipped exactly like nanosvg.hpp does.
-PxGeometry fillGeometry(const tvg::Shape* shape, const Matrix& world, slug_t tolerancePx) {
+PxGeometry fillGeometry(const tvg::Shape* shape, const Matrix& world, slug_t tolerancePx, bool errorBound=false) {
 	PxGeometry g;
 
 	const tvg::PathCommand* cmds = nullptr;
@@ -357,6 +374,7 @@ PxGeometry fillGeometry(const tvg::Shape* shape, const Matrix& world, slug_t tol
 	CurveDecomposer dec(g.curves);
 
 	dec.tolerance = tolerancePx;
+	dec.errorBound = errorBound;
 
 	const bool evenodd = shape->fillRule() == tvg::FillRule::EvenOdd;
 
@@ -1238,6 +1256,7 @@ CompositeShape loadPicture(
 
 #ifdef SLUGHORN_HAS_CLIPPER2
 		bool hasClip = false;
+		bool hasMask = false;
 		clipper::Paths clipRegion;
 		std::vector<clipper::Paths> subtracts;
 
@@ -1312,6 +1331,7 @@ CompositeShape loadPicture(
 				else applyRegion(region);
 
 				hasComp = true;
+				hasMask = true;
 #else
 				warn(cfg, 1, "mask skipped (build with SLUGHORN_CLIPPER2=ON) id=\"", id, "\"");
 #endif
@@ -1333,7 +1353,30 @@ CompositeShape loadPicture(
 			li.opacity = opacity;
 
 #ifdef SLUGHORN_HAS_CLIPPER2
-			if(hasComp) {
+			// A rectangular clip around the whole geometry is a no-op: keep the curves. Not for
+			// even-odd layers: their Clipper2 pass is also what makes a self-intersecting or
+			// overlapping even-odd path exact (the sub-path winding flip only covers nesting).
+			bool noop = false;
+
+			if(hasComp && cfg.skipContainingRectClips && hasClip && !hasMask && subtracts.empty() && !g.curves.empty() &&
+				li.fillRule == FillRule::NonZero) {
+				double rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
+
+				if(clipper::isAxisRect(clipRegion, rx0, ry0, rx1, ry1)) {
+					double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+
+					for(const auto& c : g.curves) {
+						for(const auto& [x, y] : {std::pair<slug_t, slug_t>{c.x1, c.y1}, {c.x2, c.y2}, {c.x3, c.y3}}) {
+							x0 = std::min(x0, double(x)); y0 = std::min(y0, double(y));
+							x1 = std::max(x1, double(x)); y1 = std::max(y1, double(y));
+						}
+					}
+
+					noop = x0 >= rx0 && y0 >= ry0 && x1 <= rx1 && y1 <= ry1;
+				}
+			}
+
+			if(hasComp && !noop) {
 				auto region = clipper::normalize(
 					clipper::toPaths(clipper::splitContours(g.curves, g.starts), cfg.clipTolerancePx),
 					li.fillRule
@@ -1402,9 +1445,9 @@ CompositeShape loadPicture(
 
 				if(gradFill || solid.a >= 1e-4_cv || geometryOnly) {
 					const Key key = (!keys.force && !id.empty()) ? Key(id) : keys.next();
-					const slug_t tolPx = cfg.tolerance >= TOLERANCE_EXACT ? TOLERANCE_EXACT : cfg.tolerance / scale;
+					const slug_t tolPx = cfg.tolerancePx > 0_cv ? cfg.tolerancePx : cfg.tolerance >= TOLERANCE_EXACT ? TOLERANCE_EXACT : cfg.tolerance / scale;
 
-					emit(fillGeometry(shape, world, tolPx), false, gradFill, solid, geometryOnly, key);
+					emit(fillGeometry(shape, world, tolPx, cfg.curveErrorBound), false, gradFill, solid, geometryOnly, key);
 				}
 			}
 		}

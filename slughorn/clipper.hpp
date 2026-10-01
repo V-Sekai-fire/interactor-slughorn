@@ -143,6 +143,28 @@ inline Atlas::Contours splitContours(const Atlas::Curves& curves, const std::vec
 // Flattens contours into closed polylines. Each control point is first mapped through @p xf
 // (affine maps commute with Bezier evaluation, so this is exact), then flattened in the OUTPUT
 // space, so @p tolerance is a chord error in output units.
+// True when @p paths is exactly one axis-aligned rectangle (4 corners, any orientation); its
+// extent goes to x0..y1.
+inline bool isAxisRect(const Paths& paths, double& x0, double& y0, double& x1, double& y1) {
+	if(paths.size() != 1 || paths[0].size() != 4) return false;
+
+	const Path& p = paths[0];
+
+	x0 = x1 = p[0].x;
+	y0 = y1 = p[0].y;
+
+	for(const auto& pt : p) {
+		x0 = std::min(x0, pt.x); x1 = std::max(x1, pt.x);
+		y0 = std::min(y0, pt.y); y1 = std::max(y1, pt.y);
+	}
+
+	for(const auto& pt : p) {
+		if((pt.x != x0 && pt.x != x1) || (pt.y != y0 && pt.y != y1)) return false;
+	}
+
+	return x1 > x0 && y1 > y0;
+}
+
 inline Paths toPaths(const Atlas::Contours& contours, slug_t tolerance, const Matrix& xf=Matrix::identity()) {
 	Paths paths;
 
