@@ -28,6 +28,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   linux-x86_64:
     name: Linux x86-64 / CPython 3.12-3.14 / manylinux_2_28
