@@ -507,9 +507,24 @@ inline Grid buildGrid(
 		};
 	};
 
+	// G choice. The base pick is the coarsest candidate whose busiest cell fits targetPerCell (256 if
+	// none). Past it, a finer G may be taken: among the candidates that fit targetPerCell, whose
+	// headers + lists (2 G^2 + listed, u16 elements) stay under the encoding limit and within
+	// STORE_FACTOR x the base pick's (or STORE_FLOOR), the coarsest whose mean list length (the
+	// per-fragment walk) is within WALK_SLACK of the least of them. The base pick alone listed a few
+	// large shapes (a texture's base) in nearly every cell; the storage bound keeps big layers near
+	// the base pick's memory. When nothing past it qualifies, the base pick stands; splitDeep() then
+	// cuts or halves a layer that does not fit.
+	static constexpr double WALK_SLACK = 0.10;
+	static constexpr double STORE_FACTOR = 2.0;
+	static constexpr size_t STORE_FLOOR = 4096;
+	struct Cand { uint32_t G, mx; double w; size_t store; bool fit; };
+	std::vector<Cand> cs;
+
 	for(uint32_t G : CANDIDATES) {
 		std::vector<uint32_t> counts(size_t(G) * G, 0);
 		uint32_t mx = 0;
+		size_t listed = 0;
 
 		for(const UVBox& b : boxes) {
 			if(b.u1 < 0 || b.v1 < 0 || b.u0 > 1 || b.v0 > 1) continue;
@@ -517,14 +532,27 @@ inline Grid buildGrid(
 			const auto [i0, i1] = range(b.u0, b.u1, G);
 			const auto [j0, j1] = range(b.v0, b.v1, G);
 
-			for(uint32_t j = j0; j <= j1; j++) for(uint32_t i = i0; i <= i1; i++) mx = std::max(mx, ++counts[size_t(j) * G + i]);
+			for(uint32_t j = j0; j <= j1; j++) for(uint32_t i = i0; i <= i1; i++) { mx = std::max(mx, ++counts[size_t(j) * G + i]); listed++; }
 		}
 
-		g.G = G;
-		g.maxPerCell = mx;
-
-		if(mx <= targetPerCell) break;
+		cs.push_back({G, mx, double(listed) / (double(G) * double(G)), size_t(2) * G * G + listed, mx <= targetPerCell});
 	}
+
+	const Cand* pick = nullptr;
+
+	for(const Cand& c : cs) if(c.fit) { pick = &c; break; }
+	if(!pick) pick = &cs.back();
+
+	const size_t cap = std::min<size_t>(65535, std::max<size_t>(STORE_FLOOR, size_t(STORE_FACTOR * double(pick->store))));
+	auto ok = [&](const Cand& c) { return c.fit && c.G >= pick->G && c.store <= cap; };
+	double best = -1.0;
+
+	for(const Cand& c : cs) if(ok(c) && (best < 0.0 || c.w < best)) best = c.w;
+
+	if(best >= 0.0) for(const Cand& c : cs) if(ok(c) && c.w <= best * (1.0 + WALK_SLACK)) { pick = &c; break; }
+
+	g.G = pick->G;
+	g.maxPerCell = pick->mx;
 
 	g.cells.assign(size_t(g.G) * g.G, {});
 	g.cellMax.assign(size_t(g.G) * g.G, 0.0f);
@@ -674,6 +702,118 @@ inline Atlas::Contours instanceContours(const Set& set, const Instance& in) {
 // deepest overlap seen (instances on one finest-grid cell), the "max depth".
 inline constexpr size_t LIMIT_U16 = 65536;
 
+// ------------------------------------------------------------------------------------------------
+// Size cuts
+// ------------------------------------------------------------------------------------------------
+//
+// A fragment walks one cell list per stamp layer, and a layer's grid G is set by its smallest,
+// densest instances; large instances in the same layer are listed in every cell they touch at that
+// G. So a layer whose paint order holds a long run of large shapes followed (or preceded) by small
+// ones, e.g. a texture's base under its speckle, walks the large ones many times over. sizeCuts()
+// cuts such a layer into CONSECUTIVE sub-layers (paint order kept, so the composite is unchanged)
+// where that lowers the walk: candidates are the points where the mean log2 of the largest bbox side
+// over the next minRun instances differs from that over the previous minRun by at least one (a
+// 2x size change; local maxima only), and a cut is kept, greedily and
+// recursively, only when the summed mean cell-list length (plus one per extra layer, the fixed cost
+// of a layer) drops by at least minGain.
+// The walk a layer costs once packed: its mean cell-list length, or, when splitDeep() would cut it
+// (busiest cell over maxPerCell at the finest grid, or past the u16 encoding limit), the sum over
+// consecutive halves plus one per extra layer (an estimate of those cuts).
+inline double meanWalk(const Atlas& atlas, const Set& set, const Layer& layer, slug_t canvasEmW, slug_t canvasEmH, slug_t pxPerEm, uint32_t maxPerCell) {
+	const Grid g = buildGrid(atlas, set, layer, canvasEmW, canvasEmH, pxPerEm, maxPerCell, false, false);
+	size_t listed = 0;
+
+	for(const auto& c : g.cells) listed += c.size();
+
+	const bool fits = g.maxPerCell <= maxPerCell && layer.instances.size() < 65536 && size_t(2) * g.G * g.G + listed < 65536;
+
+	if(fits || layer.instances.size() < 2) return double(listed) / (double(g.G) * double(g.G));
+
+	const size_t h = layer.instances.size() / 2;
+	Layer a, b;
+
+	a.instances.assign(layer.instances.begin(), layer.instances.begin() + h);
+	b.instances.assign(layer.instances.begin() + h, layer.instances.end());
+
+	return meanWalk(atlas, set, a, canvasEmW, canvasEmH, pxPerEm, maxPerCell) + meanWalk(atlas, set, b, canvasEmW, canvasEmH, pxPerEm, maxPerCell) + 1.0;
+}
+
+inline std::vector<Layer> sizeCuts(
+	const Set& set, Layer&& layer, slug_t canvasEmW, slug_t canvasEmH, slug_t pxPerEm, uint32_t maxPerCell,
+	size_t minRun=64, double minGain=0.1
+) {
+	const Atlas none;
+	const size_t n = layer.instances.size();
+	std::vector<Layer> out;
+
+	if(n < 2 * minRun) { out.push_back(std::move(layer)); return out; }
+
+	std::vector<double> lsz(n);
+
+	for(size_t i = 0; i < n; i++) {
+		const Box b = bounds(layer.instances[i], set);
+		const double side = std::max(double(b.x1 - b.x0), double(b.y1 - b.y0));
+
+		lsz[i] = std::log2(std::max(side, 1e-9));
+	}
+
+	// candidates: where the mean log2 size of the minRun instances after a point differs from the
+	// minRun before it by at least one (a 2x size change), at the local maximum of that difference
+	std::vector<double> pre(n + 1, 0.0);
+
+	for(size_t i = 0; i < n; i++) pre[i + 1] = pre[i] + lsz[i];
+
+	std::vector<double> step(n + 1, 0.0);
+
+	for(size_t i = minRun; i + minRun <= n; i++) {
+		step[i] = std::abs((pre[i + minRun] - pre[i]) - (pre[i] - pre[i - minRun])) / double(minRun);
+	}
+
+	std::vector<size_t> cand;
+
+	for(size_t i = minRun; i + minRun <= n; i++) {
+		if(step[i] < 1.0) continue;
+		bool peak = true;
+		for(size_t j = i > minRun ? i - minRun : 0; j <= std::min(n, i + minRun) && peak; j++) {
+			if(step[j] > step[i] || (step[j] == step[i] && j < i)) peak = false;
+		}
+		if(peak) cand.push_back(i);
+	}
+
+	std::sort(cand.begin(), cand.end());
+	cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+
+	auto slice = [&](size_t a, size_t b) {
+		Layer l;
+		l.instances.assign(layer.instances.begin() + a, layer.instances.begin() + b);
+		return l;
+	};
+
+	auto walk = [&](size_t a, size_t b) {
+		const Layer l = slice(a, b);
+		return meanWalk(none, set, l, canvasEmW, canvasEmH, pxPerEm, maxPerCell);
+	};
+
+	std::function<void(size_t, size_t)> cut = [&](size_t a, size_t b) {
+		const double whole = walk(a, b);
+		double best = whole;
+		size_t at = 0;
+
+		for(size_t c : cand) {
+			if(c <= a || c >= b) continue;
+			const double split = walk(a, c) + walk(c, b) + 1.0;
+			if(split < best) { best = split; at = c; }
+		}
+
+		if(at && best <= whole * (1.0 - minGain)) { cut(a, at); cut(at, b); }
+		else out.push_back(slice(a, b));
+	};
+
+	cut(0, n);
+
+	return out;
+}
+
 inline uint32_t splitDeep(Set& set, CompositeShape& composite, slug_t canvasEmW, slug_t canvasEmH, slug_t pxPerEm, uint32_t maxPerCell=32) {
 	uint32_t deepest = 0;
 
@@ -682,58 +822,61 @@ inline uint32_t splitDeep(Set& set, CompositeShape& composite, slug_t canvasEmW,
 	std::vector<std::vector<size_t>> remap(set.layers.size());
 
 	for(size_t li = 0; li < set.layers.size(); li++) {
-		Layer& layer = set.layers[li];
-		const Grid g = buildGrid(none, set, layer, canvasEmW, canvasEmH, pxPerEm, maxPerCell, false, false);
+		std::vector<Layer> pieces = sizeCuts(set, std::move(set.layers[li]), canvasEmW, canvasEmH, pxPerEm, maxPerCell);
 
-		deepest = std::max(deepest, g.maxPerCell);
+		for(Layer& layer : pieces) {
+			const Grid g = buildGrid(none, set, layer, canvasEmW, canvasEmH, pxPerEm, maxPerCell, false, false);
 
-		if(g.maxPerCell <= maxPerCell) {
-			remap[li].push_back(outLayers.size());
-			outLayers.push_back(std::move(layer));
+			deepest = std::max(deepest, g.maxPerCell);
 
-			continue;
-		}
+			if(g.maxPerCell <= maxPerCell) {
+				remap[li].push_back(outLayers.size());
+				outLayers.push_back(std::move(layer));
 
-		// Greedy cut on the finest grid: a new sub-layer starts when an instance would push one of
-		// its cells past the bound.
-		const uint32_t G = g.G;
-		const double pad = pxPerEm > 0_cv ? 1.0 / double(pxPerEm) : 0.0;
-		std::vector<uint32_t> counts(size_t(G) * G, 0);
-		std::vector<size_t> cells;
-		Layer cur;
-
-		for(Instance& in : layer.instances) {
-			cells.clear();
-
-			const Box b = bounds(in, set);
-			const double u0 = (double(b.x0) - pad) / canvasEmW, u1 = (double(b.x1) + pad) / canvasEmW;
-			const double v0 = 1.0 - (double(b.y1) + pad) / canvasEmH, v1 = 1.0 - (double(b.y0) - pad) / canvasEmH;
-
-			if(!(u1 < 0 || v1 < 0 || u0 > 1 || v0 > 1)) {
-				auto cl = [&](double x) { return uint32_t(std::clamp<int64_t>(int64_t(std::floor(x * G)), 0, int64_t(G) - 1)); };
-
-				for(uint32_t j = cl(v0); j <= cl(v1); j++) for(uint32_t i = cl(u0); i <= cl(u1); i++) cells.push_back(size_t(j) * G + i);
+				continue;
 			}
 
-			bool full = false;
+			// Greedy cut on the finest grid: a new sub-layer starts when an instance would push one of
+			// its cells past the bound.
+			const uint32_t G = g.G;
+			const double pad = pxPerEm > 0_cv ? 1.0 / double(pxPerEm) : 0.0;
+			std::vector<uint32_t> counts(size_t(G) * G, 0);
+			std::vector<size_t> cells;
+			Layer cur;
 
-			for(size_t c : cells) if(counts[c] + 1 > maxPerCell) { full = true; break; }
+			for(Instance& in : layer.instances) {
+				cells.clear();
 
-			if(full && !cur.instances.empty()) {
+				const Box b = bounds(in, set);
+				const double u0 = (double(b.x0) - pad) / canvasEmW, u1 = (double(b.x1) + pad) / canvasEmW;
+				const double v0 = 1.0 - (double(b.y1) + pad) / canvasEmH, v1 = 1.0 - (double(b.y0) - pad) / canvasEmH;
+
+				if(!(u1 < 0 || v1 < 0 || u0 > 1 || v0 > 1)) {
+					auto cl = [&](double x) { return uint32_t(std::clamp<int64_t>(int64_t(std::floor(x * G)), 0, int64_t(G) - 1)); };
+
+					for(uint32_t j = cl(v0); j <= cl(v1); j++) for(uint32_t i = cl(u0); i <= cl(u1); i++) cells.push_back(size_t(j) * G + i);
+				}
+
+				bool full = false;
+
+				for(size_t c : cells) if(counts[c] + 1 > maxPerCell) { full = true; break; }
+
+				if(full && !cur.instances.empty()) {
+					remap[li].push_back(outLayers.size());
+					outLayers.push_back(std::move(cur));
+					cur = Layer{};
+					std::fill(counts.begin(), counts.end(), 0u);
+				}
+
+				for(size_t c : cells) counts[c]++;
+
+				cur.instances.push_back(in);
+			}
+
+			if(!cur.instances.empty()) {
 				remap[li].push_back(outLayers.size());
 				outLayers.push_back(std::move(cur));
-				cur = Layer{};
-				std::fill(counts.begin(), counts.end(), 0u);
 			}
-
-			for(size_t c : cells) counts[c]++;
-
-			cur.instances.push_back(in);
-		}
-
-		if(!cur.instances.empty()) {
-			remap[li].push_back(outLayers.size());
-			outLayers.push_back(std::move(cur));
 		}
 	}
 
