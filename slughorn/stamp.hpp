@@ -507,18 +507,11 @@ inline Grid buildGrid(
 		};
 	};
 
-	// G choice. The base pick is the coarsest candidate whose busiest cell fits targetPerCell (256 if
-	// none). Past it, a finer G may be taken: among the candidates that fit targetPerCell, whose
-	// headers + lists (2 G^2 + listed, u16 elements) stay under the encoding limit and within
-	// STORE_FACTOR x the base pick's (or STORE_FLOOR), the coarsest whose mean list length (the
-	// per-fragment walk) is within WALK_SLACK of the least of them. The base pick alone listed a few
-	// large shapes (a texture's base) in nearly every cell; the storage bound keeps big layers near
-	// the base pick's memory. When nothing past it qualifies, the base pick stands; splitDeep() then
-	// cuts or halves a layer that does not fit.
-	static constexpr double WALK_SLACK = 0.10;
-	static constexpr double STORE_FACTOR = 2.0;
-	static constexpr size_t STORE_FLOOR = 4096;
-	struct Cand { uint32_t G, mx; double w; size_t store; bool fit; };
+	// G choice, constant work: a fragment walks one cell's list, so the bound that matters is the
+	// busiest cell. Among the candidates whose headers + lists (2 G^2 + listed, u16 elements) stay
+	// under the encoding limit, the coarsest with the least busiest cell. When none fits the limit:
+	// the coarsest that fits targetPerCell (256 if none), as before; splitDeep() then cuts or halves.
+	struct Cand { uint32_t G, mx; bool enc; };
 	std::vector<Cand> cs;
 
 	for(uint32_t G : CANDIDATES) {
@@ -535,21 +528,17 @@ inline Grid buildGrid(
 			for(uint32_t j = j0; j <= j1; j++) for(uint32_t i = i0; i <= i1; i++) { mx = std::max(mx, ++counts[size_t(j) * G + i]); listed++; }
 		}
 
-		cs.push_back({G, mx, double(listed) / (double(G) * double(G)), size_t(2) * G * G + listed, mx <= targetPerCell});
+		cs.push_back({G, mx, size_t(2) * G * G + listed < 65536});
 	}
 
 	const Cand* pick = nullptr;
 
-	for(const Cand& c : cs) if(c.fit) { pick = &c; break; }
-	if(!pick) pick = &cs.back();
+	for(const Cand& c : cs) if(c.enc && (!pick || c.mx < pick->mx)) pick = &c;
 
-	const size_t cap = std::min<size_t>(65535, std::max<size_t>(STORE_FLOOR, size_t(STORE_FACTOR * double(pick->store))));
-	auto ok = [&](const Cand& c) { return c.fit && c.G >= pick->G && c.store <= cap; };
-	double best = -1.0;
-
-	for(const Cand& c : cs) if(ok(c) && (best < 0.0 || c.w < best)) best = c.w;
-
-	if(best >= 0.0) for(const Cand& c : cs) if(ok(c) && c.w <= best * (1.0 + WALK_SLACK)) { pick = &c; break; }
+	if(!pick) {
+		for(const Cand& c : cs) if(c.mx <= targetPerCell) { pick = &c; break; }
+		if(!pick) pick = &cs.back();
+	}
 
 	g.G = pick->G;
 	g.maxPerCell = pick->mx;
@@ -714,12 +703,12 @@ inline constexpr size_t LIMIT_U16 = 65536;
 // where that lowers the walk: candidates are the points where the mean log2 of the largest bbox side
 // over the next minRun instances differs from that over the previous minRun by at least one (a
 // 2x size change; local maxima only), and a cut is kept, greedily and
-// recursively, only when the summed mean cell-list length (plus one per extra layer, the fixed cost
-// of a layer) drops by at least minGain.
-// The walk a layer costs once packed: its mean cell-list length, or, when splitDeep() would cut it
-// (busiest cell over maxPerCell at the finest grid, or past the u16 encoding limit), the sum over
+// recursively, only when the summed busiest-cell count (plus one per extra layer, the fixed cost of
+// a layer) drops by at least minGain.
+// The work a layer costs once packed, constant-work measure: its busiest cell, or, when splitDeep()
+// would cut it (busiest cell over maxPerCell, or past the u16 encoding limit), the sum over
 // consecutive halves plus one per extra layer (an estimate of those cuts).
-inline double meanWalk(const Atlas& atlas, const Set& set, const Layer& layer, slug_t canvasEmW, slug_t canvasEmH, slug_t pxPerEm, uint32_t maxPerCell) {
+inline double worstWalk(const Atlas& atlas, const Set& set, const Layer& layer, slug_t canvasEmW, slug_t canvasEmH, slug_t pxPerEm, uint32_t maxPerCell) {
 	const Grid g = buildGrid(atlas, set, layer, canvasEmW, canvasEmH, pxPerEm, maxPerCell, false, false);
 	size_t listed = 0;
 
@@ -727,7 +716,7 @@ inline double meanWalk(const Atlas& atlas, const Set& set, const Layer& layer, s
 
 	const bool fits = g.maxPerCell <= maxPerCell && layer.instances.size() < 65536 && size_t(2) * g.G * g.G + listed < 65536;
 
-	if(fits || layer.instances.size() < 2) return double(listed) / (double(g.G) * double(g.G));
+	if(fits || layer.instances.size() < 2) return double(g.maxPerCell);
 
 	const size_t h = layer.instances.size() / 2;
 	Layer a, b;
@@ -735,7 +724,7 @@ inline double meanWalk(const Atlas& atlas, const Set& set, const Layer& layer, s
 	a.instances.assign(layer.instances.begin(), layer.instances.begin() + h);
 	b.instances.assign(layer.instances.begin() + h, layer.instances.end());
 
-	return meanWalk(atlas, set, a, canvasEmW, canvasEmH, pxPerEm, maxPerCell) + meanWalk(atlas, set, b, canvasEmW, canvasEmH, pxPerEm, maxPerCell) + 1.0;
+	return worstWalk(atlas, set, a, canvasEmW, canvasEmH, pxPerEm, maxPerCell) + worstWalk(atlas, set, b, canvasEmW, canvasEmH, pxPerEm, maxPerCell) + 1.0;
 }
 
 inline std::vector<Layer> sizeCuts(
@@ -791,7 +780,7 @@ inline std::vector<Layer> sizeCuts(
 
 	auto walk = [&](size_t a, size_t b) {
 		const Layer l = slice(a, b);
-		return meanWalk(none, set, l, canvasEmW, canvasEmH, pxPerEm, maxPerCell);
+		return worstWalk(none, set, l, canvasEmW, canvasEmH, pxPerEm, maxPerCell);
 	};
 
 	std::function<void(size_t, size_t)> cut = [&](size_t a, size_t b) {
