@@ -143,9 +143,7 @@ endif()
 if(SLUGHORN_CLIPPER2)
 	if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ext/clipper2/CPP/Clipper2Lib")
 		message(FATAL_ERROR
-			"ext/clipper2 not found. Run:
-"
-			"  git submodule update --init --recursive"
+			"ext/clipper2 is vendored in this repository and is missing from the checkout."
 		)
 	endif()
 
