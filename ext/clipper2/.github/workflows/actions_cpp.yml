@@ -1,0 +1,123 @@
+name: C++
+on:
+  push:
+  pull_request:
+jobs:
+  windows-latest:
+    runs-on: 'windows-latest'
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '16'
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+    - name: Build
+      run: |
+        mkdir CPP/build
+        cd CPP/build
+        cmake .. -DCLIPPER2_TESTS=ON -DCLIPPER2_UTILS:BOOL=ON -DCLIPPER2_EXAMPLES:BOOL=ON
+        cmake --build . --config RelWithDebInfo --parallel
+    - name: Run tests
+      run: |
+        cd CPP/build
+        ctest . -C RelWithDebInfo --output-on-failure
+  ubuntu-latest-gcc-default:
+    runs-on: 'ubuntu-latest'
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '16'
+    - name: Build
+      run: |
+        mkdir CPP/build
+        cd CPP/build
+        cmake .. -DCLIPPER2_TESTS=ON
+        make
+    - name: Run tests
+      run: |
+        cd CPP/build
+        env CTEST_OUTPUT_ON_FAILURE=1 make test
+  ubuntu-latest-gcc-11:
+    runs-on: 'ubuntu-latest'
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '16'
+    - name: Install gcc 11
+      run: |
+        sudo apt update
+        sudo apt install gcc-11 g++-11
+        sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 110 --slave /usr/bin/g++ g++ /usr/bin/g++-11 --slave /usr/bin/gcov gcov /usr/bin/gcov-11
+    - name: Build
+      run: |
+        mkdir CPP/build
+        cd CPP/build
+        cmake .. -DCLIPPER2_TESTS=ON
+        make
+    - name: Run tests
+      run: |
+        cd CPP/build
+        env CTEST_OUTPUT_ON_FAILURE=1 make test
+  ubuntu-latest-clang-default:
+    runs-on: 'ubuntu-latest'
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '16'
+    - name: Build
+      run: |
+        export CC=/usr/bin/clang
+        export CXX=/usr/bin/clang++
+        mkdir CPP/build
+        cd CPP/build
+        cmake .. -DCLIPPER2_TESTS=ON
+        make
+    - name: Run tests
+      run: |
+        cd CPP/build
+        env CTEST_OUTPUT_ON_FAILURE=1 make test
+  ubuntu-latest-clang-17:
+    runs-on: 'ubuntu-latest'
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '16'
+    - name: Install clang 17
+      run: |
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x llvm.sh
+        sudo ./llvm.sh 17
+    - name: Build
+      run: |
+        export CC=/usr/bin/clang-17
+        export CXX=/usr/bin/clang++-17
+        mkdir CPP/build
+        cd CPP/build
+        cmake .. -DCLIPPER2_TESTS=ON
+        make
+    - name: Run tests
+      run: |
+        cd CPP/build
+        env CTEST_OUTPUT_ON_FAILURE=1 make test
+  macos-latest:
+    runs-on: 'macos-latest'
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '16'
+    - name: Build
+      run: |
+        mkdir CPP/build
+        cd CPP/build
+        cmake .. -DCLIPPER2_TESTS=ON
+        make
+    - name: Run tests
+      run: |
+        cd CPP/build
+        env CTEST_OUTPUT_ON_FAILURE=1 make test
