@@ -25,21 +25,6 @@ void bind_bake(py::module_& bake) {
 		.def_readonly("curves_after", &MergeResult::curvesAfter)
 	;
 
-	py::enum_<Paint::Type>(bake, "PaintType")
-		.value("Solid", Paint::Type::Solid)
-		.value("Linear", Paint::Type::Linear)
-		.value("Radial", Paint::Type::Radial)
-	;
-
-	py::class_<Paint>(bake, "Paint")
-		.def_readonly("type", &Paint::type)
-		.def_readonly("color", &Paint::color)
-		.def_readonly("stops", &Paint::stops)
-		.def_readonly("spread", &Paint::spread)
-		.def_readonly("inner_radius", &Paint::innerRadius)
-		.def_readonly("opaque", &Paint::opaque)
-	;
-
 	py::class_<BakeConfig>(bake, "BakeConfig")
 		.def(py::init([](slug_t width, slug_t height, slug_t tolerancePx, bool planarize, bool vUp) {
 			BakeConfig c;
@@ -58,32 +43,24 @@ void bind_bake(py::module_& bake) {
 		.def_readwrite("tolerance_px", &BakeConfig::tolerancePx)
 		.def_readwrite("opaque_alpha", &BakeConfig::opaqueAlpha)
 		.def_readwrite("planarize", &BakeConfig::planarize)
-		.def_readwrite("alpha_test", &BakeConfig::alphaTest, "> 0: cutout (alpha-tested) bake, see bake.hpp bakeCutout().")
 	;
 
 	py::class_<BakedMesh>(bake, "BakedMesh")
 		.def_property_readonly("positions", [](const BakedMesh& m) {
 			return flatView2D(m.positions, 2);
 		}, "Zero-copy (N, 2) float32 view: UV in [0,1], v = 0 at the top edge (SVG Y-down).")
-		.def_property_readonly("paint_ids", [](const BakedMesh& m) {
-			return flatView2D(m.paintIds, 1);
-		}, "Zero-copy (N, 1) uint32 view: per-vertex paint index.")
-		.def_property_readonly("params", [](const BakedMesh& m) {
-			return flatView2D(m.params, 2);
-		}, "Zero-copy (N, 2) float32 view: linear (t, 0), radial (gx, gy), solid (0, 0).")
 		.def_property_readonly("indices", [](const BakedMesh& m) {
 			return flatView2D(m.indices, 3);
 		}, "Zero-copy (T, 3) uint32 view; opaque triangles first, then the overlay range.")
 		.def_readonly("opaque_index_count", &BakedMesh::opaqueIndexCount)
 		.def_readonly("overlay_index_count", &BakedMesh::overlayIndexCount)
-		.def_readonly("paints", &BakedMesh::paints)
 		.def_readonly("triangles_before", &BakedMesh::trianglesBefore)
 		.def_readonly("triangles_after", &BakedMesh::trianglesAfter)
 		.def_readonly("stroke_layers", &BakedMesh::strokeLayers)
 		.def_readonly("tolerance_px", &BakedMesh::tolerancePx)
 		.def("__repr__", [](const BakedMesh& m) {
 			return "BakedMesh(" + std::to_string(m.positions.size() / 2) + " vertices, " +
-				std::to_string(m.trianglesAfter) + " triangles, " + std::to_string(m.paints.size()) + " paints)";
+				std::to_string(m.trianglesAfter) + " triangles)";
 		})
 	;
 
