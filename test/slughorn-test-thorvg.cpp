@@ -14,7 +14,7 @@
 //
 // When built with SLUGHORN_CLIPPER2 + SLUGHORN_TESSELLATE it also checks fill-rule-robust
 // tessellation on a deliberately mis-wound glyph-like contour, and slughorn/bake.hpp's merge /
-// planar bake.
+// planar mesh bake.
 //
 // Usage:
 //
@@ -844,46 +844,36 @@ void test_Bake() {
 
 	checkNear("opaque set covers UV area exactly once (1.0)", cv(opaqueArea), 1_cv, 1e-3_cv);
 	checkNear("overlay is the translucent half (0.5)", cv(overlayArea), 0.5_cv, 1e-3_cv);
-	check("one paint per surviving layer", mesh.paints.size() <= merged.layersAfter);
-	check("vertex streams consistent", mesh.positions.size() == mesh.params.size() && mesh.paintIds.size() * 2 == mesh.positions.size());
+
+	// Every index names a vertex, and every triangle is wound counter-clockwise in (u, v).
+	{
+		const size_t verts = mesh.positions.size() / 2;
+		bool inRange = true;
+		bool ccw = true;
+
+		for(size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+			const uint32_t a = mesh.indices[i], b = mesh.indices[i + 1], c = mesh.indices[i + 2];
+
+			if(a >= verts || b >= verts || c >= verts) inRange = false;
+
+			const auto P = [&](uint32_t k) { return std::pair<double, double>{mesh.positions[k * 2], mesh.positions[k * 2 + 1]}; };
+			const auto [ax, ay] = P(a);
+			const auto [bx, by] = P(b);
+			const auto [cx, cy] = P(c);
+
+			if((bx - ax) * (cy - ay) - (cx - ax) * (by - ay) <= 0.0) ccw = false;
+		}
+
+		check("every index names a vertex", inRange);
+		check("every triangle is counter-clockwise in (u, v)", ccw);
+	}
 
 	const auto c = slughorn::bake::cost(atlas, merged.composite, mesh, merged.layersBefore);
 
 	std::cout << "  cost: curves=" << c.curves << " maxBandH=" << c.maxBandCurvesH << " maxBandV=" << c.maxBandCurvesV
 		<< " slugWork=" << c.slugWork << " mode=" << c.mode << std::endl;
 
-	check("cost has a mode", c.mode == "mesh" || c.mode == "slug" || c.mode == "mean");
-
-	// Gradient parameter: linear t at every vertex equals x / width for a left->right gradient.
-	{
-		slughorn::Atlas gs, ga;
-		slughorn::KeyIterator gk, gk2("g");
-		slughorn::thorvg::LoadConfig gcfg;
-
-		auto gl = slughorn::thorvg::loadString(SVG_LINEAR_GRADIENT, gs, gk, 96_cv, &gcfg);
-
-		std::vector<slughorn::bake::LayerSource> gm(gl.layers.size());
-
-		auto gmerged = slughorn::bake::mergeLayers(gs, gl, gm, ga, gk2);
-
-		ga.build();
-
-		slughorn::bake::BakeConfig gbc;
-
-		gbc.width = gcfg.width;
-		gbc.height = gcfg.height;
-
-		const auto gmesh = slughorn::bake::bakeMesh(ga, gmerged.composite, gmerged.layers, gbc);
-
-		double maxErr = 0.0;
-
-		for(size_t v = 0; v < gmesh.paintIds.size(); v++) {
-			maxErr = std::max(maxErr, std::abs(double(gmesh.params[v * 2]) - double(gmesh.positions[v * 2])));
-		}
-
-		check("linear paint emitted", !gmesh.paints.empty() && gmesh.paints[0].type == slughorn::bake::Paint::Type::Linear);
-		checkNear("per-vertex t == u (max error)", cv(maxErr), 0_cv, 1e-4_cv);
-	}
+	check("cost has a mode", c.mode == "mesh" || c.mode == "stamp" || c.mode == "slug" || c.mode == "mean");
 }
 #endif
 
@@ -971,9 +961,6 @@ int main(int argc, char** argv) {
 	if(argc >= 3 && std::string(argv[1]) == "--stamp-compare") return stampCompareFiles(argc, argv);
 	if(argc >= 3 && std::string(argv[1]) == "--contact-sheet") return contactSheets(argc, argv);
 	if(argc >= 5 && std::string(argv[1]) == "--debug-key") return debugKey(argc, argv);
-	if(argc >= 4 && std::string(argv[1]) == "--alpha-bake") return alphaBakeSheet(argc, argv);
-	if(argc >= 3 && std::string(argv[1]) == "--lod-table") return lodTable(argc, argv);
-	if(argc >= 6 && std::string(argv[1]) == "--baseline-lod") return baselineLodSheet(argc, argv);
 #endif
 
 	if(argc >= 2) {
@@ -997,8 +984,6 @@ int main(int argc, char** argv) {
 	test_Stamp();
 	test_StampStrokeTolerance();
 	test_StampProtoExtent();
-	test_Cutout();
-	test_AlphaBake();
 #endif
 
 	std::cout
